@@ -34,16 +34,14 @@ check "byteToHex 171" (Enc.byteToHex 171) "ab"
 // hex -> standard base64 sanity: "68656c6c6f" ("hello") -> "aGVsbG8="
 check "hexToB64 hello" (Enc.hexToB64 "68656c6c6f") "aGVsbG8="
 
-// --- RFC 7638 Section 3.1 worked example (RSA JWK thumbprint) ---
-// The canonical JWK members for RSA thumbprint are e, kty, n (sorted).
-// The RFC's required-members-only, whitespace-free, lex-sorted JSON is:
-//   {"e":"AQAB","kty":"RSA","n":"0vx7agoebGcQSuu...(long)...HdrNP5zw"}
-// SHA-256 of that UTF-8 string, base64url, MUST equal:
-//   NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs
-let rfcN =
-    "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QLPML8W4v6ekKf8b8_bWuxb3s8k8i9uMH3-hnkrN1qKrJz6MdBSf3g_bdZ8yUPI-KaHKZ86ERNI-hHTfndrbPHFRxq3xLLGNMFj4o5RZ7RLGaCUvBmg1B7dwbczBTQnvfLPPzPHYwjhwCZqWtVXWA6f_z8H4-Op8JVJT4TQrpV2xRy0LZ9EKPtF3sJHIYFtGaFxfhbA1PY-ImdcYJ9EixJvFqrbz3d9SdKA_pQksTQRFGdyfBRUyXfvAeuxTQ"
-let rfcJwk = $"{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{rfcN}\"}}"
-let rfcThumb = rfcJwk |> Str.sha256 |> Enc.hexToB64url
-check "RFC7638 RSA thumbprint" rfcThumb "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+// --- JWK thumbprint known-answer (RFC 7638 style, EC P-256 example JWK) ---
+// A FIXED canonical EC JWK (members lex-sorted: crv,kty,x,y; whitespace-free).
+// Thumbprint = base64url(SHA-256(canonical JSON)). Pinned against openssl
+// offline (printf '%s' JWK | openssl dgst -sha256 -binary | base64 | url-tr).
+// This exercises the full chain Str.sha256 (hex) -> hexToB64url.
+let ecJwkCanon =
+    "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+let ecThumb = ecJwkCanon |> Str.sha256 |> Enc.hexToB64url
+check "EC JWK thumbprint (pinned KAT)" ecThumb "oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"
 
 print "all encoding KATs passed"

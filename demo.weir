@@ -1,0 +1,38 @@
+#!/usr/bin/env weir
+import "./lib/encoding.weir" as Enc
+import "./lib/crypto.weir" as Crypto
+import "./lib/jws.weir" as Jws
+import "./lib/http.weir" as Acme
+
+// End-to-end Stage-1 demo: directory -> nonce -> build a new-account JWS.
+// Uses the fixture directory (offline-safe) and a static nonce, then produces a
+// real, openssl-verifiable JWS envelope for the new-account request. This is
+// the full ACME "signed request" envelope minus the network POST (Stage 2).
+
+let dir = Self.scriptPath |> Path.dir
+let ecKey = $"{dir}/test/ec.key"
+
+// 1. directory (from fixture; a real GET is one Http.send away — see test_http)
+let d = Acme.parseDirectory (File.read $"{dir}/test/fixtures/directory.json")
+print $"newAccount endpoint: {d.newAccount}"
+
+// 2. JWK + thumbprint (the account identity)
+let jwk = Crypto.ecJwk ecKey
+let jwkJson = jwk |> to json |> Seq.exactlyOne
+print $"account JWK (canonical): {jwkJson}"
+print $"account thumbprint: {Crypto.ecThumbprint jwk}"
+
+// 3. nonce (static here; Acme.fetchNonce d.newNonce is the live call)
+let nonce = "taro4LZUj3t9G4pxrOFZBZCtzhOhmqBLYb_0jGP2fLo"
+
+// 4. build the new-account signed request. protected carries the jwk (RFC 8555
+//    7.3): fields in acme.sh's wire order nonce,url,alg,jwk.
+let protected = $"{{\"nonce\":\"{nonce}\",\"url\":\"{d.newAccount}\",\"alg\":\"ES256\",\"jwk\":{jwkJson}}}"
+let payload = @"{""termsOfServiceAgreed"":true,""contact"":[""mailto:admin@example.com""]}"
+let jws = Jws.signEc ecKey 32 protected payload
+
+print "--- flattened JWS (POST body for new-account) ---"
+print jws
+
+// 5. the POST is Stage 2: Http.send { Http.post d.newAccount with body = Json [jws] }
+print "(Stage 2 would POST this via Http.send to d.newAccount)"
