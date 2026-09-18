@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# asdf-plugin: dummy 1.0.0
+# asdf-plugin: dummy 2.0.0
+exec dummytool "$@"

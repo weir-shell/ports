@@ -1,0 +1,55 @@
+#!/usr/bin/env weir
+// asdf where <plugin> [version] — ports command-where.bash.
+// Prints the install path for a plugin's resolved (or given) version.
+// Observable behaviour matched to bash: stdout string + exit code.
+
+import "../core.weir" as Core
+
+let args = Self.args |> Seq.force
+let plugin = args |> Seq.tryItem 0 |> Option.defaultValue ""
+let fullVersion = args |> Seq.tryItem 1 |> Option.defaultValue ""
+
+// check_if_plugin_exists: empty name or missing plugin -> stderr + exit 1
+if plugin == "" then
+    printerr "No plugin given"
+    exit 1
+
+if not (Core.pluginExists plugin) then
+    printerr $"No such plugin: {plugin}"
+    exit 1
+
+// resolve the version: given arg wins, else find_versions' first version
+let version =
+    if fullVersion == "" then
+        Core.findVersions plugin (pwd |> Seq.exactlyOne) |> _.versions |> Seq.tryHead |> Option.defaultValue ""
+    else
+        // a given version: ref: keeps its type; else the bare token
+        match Core.specOf fullVersion with
+        | Ref r -> r
+        | _ -> fullVersion
+
+if version == "" then
+    print (Core.noVersionSetText plugin)
+    exit 1
+
+// install_type is "version" unless a ref: was given (where_command sets
+// install_type=ref only in the explicit-arg ref branch)
+let spec =
+    if fullVersion == "" then Core.Plain version
+    else
+        match Core.specOf fullVersion with
+        | Ref r -> Core.Ref r
+        | _ -> Core.Plain version
+
+let ipath = Core.installPath plugin spec
+
+if Dir.exists ipath then
+    print ipath
+    exit 0
+
+if version == "system" then
+    print "System version is selected"
+    exit 1
+
+print "Version not installed"
+exit 1

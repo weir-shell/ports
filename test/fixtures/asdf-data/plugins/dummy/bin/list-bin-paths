@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# emit two bin dirs relative to install
+echo "bin sub/bin"

@@ -1,0 +1,420 @@
+module Core
+// The asdf spine, ported from lib/utils.bash + the read-only slices of
+// lib/functions/*.bash. This is the utils.bash equivalent: a
+// declaration-only module (types + signed exports), imported qualified
+// by the four command scripts and the dispatcher.
+//
+// The THESIS of the port: a .tool-versions file becomes a TYPED value
+// (seq<ToolVersions>), not a stream poked at with grep/sed/cut. Version
+// resolution returns a typed Resolved record, not bash's `version|path`
+// string (that `|`-join was a bash limitation — one channel for two
+// facts). Plugin callbacks run as EXTERNAL PROGRAMS with env set
+// (within/env-sigil), never sourced — safer than bash by construction.
+
+// ---- types ------------------------------------------------------------
+
+/// one plugin line of a .tool-versions file: the plugin name and its
+/// ordered versions (asdf keeps order — the first is the "preset")
+type ToolVersions = {
+    plugin: string
+    versions: seq<string>
+}
+
+/// the outcome of resolving a plugin's version: the versions found, the
+/// source that provided them (a file path, or an env-var description —
+/// asdf's `version_file_path` / describe-string), and whether the source
+/// was found at all. Replaces bash's `version|path` string [FINDING].
+type Resolved = {
+    /// the versions, in file order (empty when nothing was set)
+    versions: seq<string>
+    /// human description of the source: a path, or "ASDF_X_VERSION
+    /// environment variable" — this is asdf's second `|`-field verbatim
+    source: string
+    /// true when a version was set anywhere in the precedence chain
+    found: bool
+}
+
+/// a version split into asdf's (install_type, version) shape:
+/// `ref:main` -> Ref "main"; `path:/x` -> PathVer "/x"; `1.2.3` ->
+/// Plain "1.2.3"; `system` -> System. Replaces bash's
+/// `IFS=':' read -a version_info` here-string splitting [FINDING].
+type VersionSpec =
+    | Plain of string
+    | Ref of string
+    | PathVer of string
+    | System
+
+// ---- config / directory resolution (utils.bash top) -------------------
+
+/// the tool-versions filename: ASDF_DEFAULT_TOOL_VERSIONS_FILENAME or
+/// ".tool-versions". Ports asdf_tool_versions_filename.
+let toolVersionsFilename : unit -> string
+
+/// the asdf data dir: ASDF_DATA_DIR, else $HOME/.asdf, else asdfDir.
+/// Ports asdf_data_dir.
+let dataDir : unit -> string
+
+/// ASDF_DIR (the install root). Ports asdf_dir — but a weir script's
+/// own root is Self.entryPath's grandparent, not BASH_SOURCE.
+let asdfDir : unit -> string
+
+/// the plugins dir, or one plugin's dir when a name is given.
+/// Ports get_plugin_path.
+let pluginPath : string -> string
+
+/// resolve a leading `~/` to $HOME. Ports util_resolve_user_path.
+let resolveUserPath : string -> string
+
+// ---- parsing (the typed .tool-versions thesis) ------------------------
+
+/// strip comments/blank-effects from tool-version file lines: drop lines
+/// whose first non-blank is '#', cut a '#' and everything after, trim
+/// trailing blanks, drop now-empty lines. Ports strip_tool_version_comments
+/// (a 3-step sed) as an explicit pure pipeline [FINDING: reads BETTER].
+let stripComments : seq<string> -> seq<string>
+
+/// parse a whole .tool-versions file's lines into typed rows. Ports the
+/// heart of parse_asdf_version_file, but yields ALL plugins at once as a
+/// typed value rather than grepping per-plugin.
+let parseToolVersions : seq<string> -> seq<ToolVersions>
+
+/// the versions set for one plugin in a parsed file (path: prefixes get
+/// ~ resolution, matching parse_asdf_version_file). Empty seq = unset.
+let versionsFor : seq<ToolVersions> -> string -> seq<string>
+
+/// classify one version token into asdf's install_type/version shape.
+/// Ports the `IFS=':' read version_info` dispatch used all over utils.bash.
+let specOf : string -> VersionSpec
+
+// ---- version resolution (find_versions & friends) ---------------------
+
+/// the ASDF_<UPCASE>_VERSION env override for a plugin, if set.
+/// Ports get_version_from_env (tr '[:lower:]-' '[:upper:]_').
+let versionFromEnv : string -> Option<string>
+
+/// resolve a plugin's versions with asdf's full precedence:
+///   1. ASDF_<NAME>_VERSION env var
+///   2. .tool-versions walking UP from `startDir` to (not incl) /
+///   3. $HOME/.tool-versions
+///   4. $ASDF_DEFAULT_TOOL_VERSIONS_FILENAME as an absolute fallback
+/// Ports find_versions. Returns a typed Resolved, not `version|path`.
+let findVersions : string -> string -> Resolved
+
+/// the first (preset) version for a plugin, resolved from PWD.
+/// Ports get_preset_version_for.
+let presetVersionFor : string -> Option<string>
+
+// ---- install paths ----------------------------------------------------
+
+/// the install directory for a (plugin, spec). Ports get_install_path +
+/// find_install_path (the ref-/path-/plain dispatch folded in).
+let installPath : string -> VersionSpec -> string
+
+/// the versions actually installed for a plugin (dirs under
+/// installs/<plugin>, with ref- -> ref: rename). Ports list_installed_versions.
+let installedVersions : string -> seq<string>
+
+// ---- plugin existence -------------------------------------------------
+
+/// true when installs/../plugins/<name> exists. Ports the check in
+/// check_if_plugin_exists (but as data — the command decides to exit).
+let pluginExists : string -> bool
+
+/// list installed plugin names (dirs under plugins/). Ports
+/// plugin_list_command's directory scan (read-only slice).
+let pluginList : unit -> seq<string>
+
+// ---- plugin callback invocation (the key redesign) --------------------
+
+/// the exec (bin) paths for an installed (plugin, version): runs the
+/// plugin's list-bin-paths callback as an EXTERNAL PROGRAM with
+/// ASDF_INSTALL_* env set (default "bin" when absent), joined onto the
+/// install path. Ports list_plugin_bin_paths + list_plugin_exec_paths.
+/// Callbacks are run, never sourced [FINDING: safer than bash].
+let execPaths : string -> string -> seq<string>
+
+/// run the plugin's list-all callback (external program) and return its
+/// whitespace-split versions. Ports list_all_command's core.
+let listAll : string -> seq<string>
+
+// ---- shims (for `which`) ----------------------------------------------
+
+/// the (plugin, version) markers baked into a shim file as
+/// `# asdf-plugin: <plugin> <version>` comments. Ports the grep in
+/// shim_plugin_versions — here a typed Regex extraction [FINDING: better].
+let shimVersions : string -> seq<string * string>
+
+/// pick the plugin+version for a shim: the first plugin/set-version pair
+/// (walking the shim's plugins, each plugin's find_versions result) that
+/// the shim actually carries a marker for. Ports select_version. Returns
+/// (plugin, version) or None.
+let selectVersion : string -> Option<string * string>
+
+/// the resolved executable path for a shim, after select_version: search
+/// the chosen (plugin, version)'s exec-paths for an executable named like
+/// the shim (the `command -v` under a shims-stripped, exec-paths-prepended
+/// PATH). Ports the read-only core of with_shim_executable/run_within_env.
+let whichExecutable : string -> Option<string>
+
+// ---- messages (verbatim-matched to bash) ------------------------------
+
+/// the "No version is set for X; please run ..." line. Ports
+/// display_no_version_set VERBATIM.
+let noVersionSetText : string -> string
+
+/// the "version X is not installed for Y" line. Ports
+/// version_not_installed_text VERBATIM.
+let versionNotInstalledText : string -> string -> string
+
+// =======================================================================
+// implementations (signatures above are the exports)
+// =======================================================================
+
+let toolVersionsFilename () =
+    Env.get "ASDF_DEFAULT_TOOL_VERSIONS_FILENAME" |> Option.defaultValue ".tool-versions"
+
+let asdfDir () =
+    // ASDF_DIR, else the grandparent of the entry script (dirname-dirname-$0,
+    // the bash asdf_dir fallback). Self.entryPath is the invoked script.
+    match Env.get "ASDF_DIR" with
+    | Some d -> d
+    | None -> Self.entryPath |> Path.dir |> Path.dir
+
+let dataDir () =
+    match Env.get "ASDF_DATA_DIR" with
+    | Some d -> d
+    | None ->
+        match Env.get "HOME" with
+        | Some h -> $"{h}/.asdf"
+        | None -> asdfDir ()
+
+let pluginPath name =
+    if name == "" then $"{dataDir ()}/plugins"
+    else $"{dataDir ()}/plugins/{name}"
+
+let resolveUserPath path =
+    // strings beginning with ~/ are shell-style home paths
+    if path |> Str.startsWith "~/" then
+        match Env.get "HOME" with
+        | Some h -> $"{h}/{path |> Str.sub 2 (Str.length path - 2)}"
+        | None -> path
+    else path
+
+// ---- parsing ----------------------------------------------------------
+
+let stripComments lines =
+    lines
+    |> Seq.map (fun l ->
+        // step 2: cut a '#' and everything after
+        match l |> Str.trySplitOnce "#" with
+        | Some (before, _) -> before
+        | None -> l)
+    // step 3: trim trailing blanks (trimEnd)
+    |> Seq.map Str.trimEnd
+    // steps 1 & "print non-empty": drop lines that are now empty (this
+    // also covers "starts with blank then #", since those cut to "")
+    |> Seq.where (fun l -> l <> "")
+
+let parseToolVersions lines =
+    lines
+    |> stripComments
+    |> Seq.choose (fun l ->
+        match l |> Str.fields |> Seq.force with
+        | [] -> None
+        | name :: vers -> Some { plugin = name; versions = vers })
+
+let versionsFor rows plugin =
+    rows
+    |> Seq.tryFind (fun r -> r.plugin == plugin)
+    |> Option.map (fun r ->
+        r.versions
+        |> Seq.map (fun v ->
+            // parse_asdf_version_file resolves a leading path: prefix
+            if v |> Str.startsWith "path:" then
+                $"path:{resolveUserPath (v |> Str.sub 5 (Str.length v - 5))}"
+            else v))
+    |> Option.defaultValue []
+
+let specOf v =
+    match v |> Str.trySplitOnce ":" with
+    | Some ("ref", r) -> Ref r
+    | Some ("path", p) -> PathVer p
+    | _ -> if v == "system" then System else Plain v
+
+// ---- version resolution ----------------------------------------------
+
+let versionFromEnv plugin =
+    let up = plugin |> Str.toUpper |> Str.replace "-" "_"
+    Env.get $"ASDF_{up}_VERSION"
+    |> Option.bind (fun v -> if v == "" then None else Some v)
+
+// read a file's parsed rows, or [] if it does not exist
+let readRows path =
+    if File.exists path then File.read path |> parseToolVersions
+    else []
+
+// the .tool-versions files to check, in precedence order, walking up
+// from startDir to (but NOT including) "/", then $HOME
+let parentOf p =
+    let parent = Path.dir p
+    if p == "/" then []
+    elif parent == "" then []
+    else [parent]
+
+let searchDirs startDir =
+    let chain = Graph.reach (fun p -> p) parentOf startDir
+    let ancestors = chain |> Seq.where (fun p -> p <> "/")
+    let home = Env.get "HOME" |> Option.defaultValue ""
+    // ancestors FIRST (nearest dir wins), then $HOME as the tail — piped
+    // Seq.append puts the tail in the pipe, so home is the pipe subject
+    (if home == "" then [] else [home]) |> Seq.append ancestors
+
+let findVersions plugin startDir =
+    match versionFromEnv plugin with
+    | Some v ->
+        let up = plugin |> Str.toUpper |> Str.replace "-" "_"
+        { versions = v |> Str.fields; source = $"ASDF_{up}_VERSION environment variable"; found = true }
+    | None ->
+        let fname = toolVersionsFilename ()
+        // walk the dirs; the first with a set version wins
+        let hit =
+            searchDirs startDir
+            |> Seq.map (fun d -> $"{d}/{fname}")
+            |> Seq.tryPick (fun path ->
+                let vs = versionsFor (readRows path) plugin |> Seq.force
+                if vs |> Seq.isEmpty then None else Some (vs, path))
+        match hit with
+        | Some (vs, path) -> { versions = vs; source = path; found = true }
+        | None ->
+            // final fallback: ASDF_DEFAULT_TOOL_VERSIONS_FILENAME as an
+            // absolute path (asdf checks it verbatim as a file)
+            match Env.get "ASDF_DEFAULT_TOOL_VERSIONS_FILENAME" with
+            | Some abs when File.exists abs ->
+                let vs = versionsFor (readRows abs) plugin |> Seq.force
+                if vs |> Seq.isEmpty then { versions = []; source = ""; found = false }
+                else { versions = vs; source = abs; found = true }
+            | _ -> { versions = []; source = ""; found = false }
+
+let presetVersionFor plugin =
+    let r = findVersions plugin (pwd |> Seq.exactlyOne)
+    r.versions |> Seq.tryHead
+
+// ---- install paths ----------------------------------------------------
+
+let installPath plugin spec =
+    let installs = $"{dataDir ()}/installs"
+    match spec with
+    | System -> ""
+    | Plain v -> $"{installs}/{plugin}/{v}"
+    | Ref r -> $"{installs}/{plugin}/ref-{r}"
+    | PathVer p -> resolveUserPath p
+
+let installedVersions plugin =
+    let dir = $"{dataDir ()}/installs/{plugin}"
+    if Dir.exists dir then
+        Dir.list dir
+        |> Seq.where Dir.exists
+        |> Seq.map (fun p ->
+            let b = Path.fileName p
+            if b |> Str.startsWith "ref-" then $"ref:{b |> Str.sub 4 (Str.length b - 4)}"
+            else b)
+    else []
+
+// ---- plugin existence -------------------------------------------------
+
+let pluginExists name =
+    Dir.exists $"{dataDir ()}/plugins/{name}"
+
+let pluginList () =
+    let dir = $"{dataDir ()}/plugins"
+    if Dir.exists dir then Dir.list dir |> Seq.where Dir.exists |> Seq.map Path.fileName
+    else []
+
+// ---- plugin callback invocation (the key redesign) --------------------
+
+// run one plugin callback script as an EXTERNAL PROGRAM with an env
+// overlay, returning its stdout lines. The head is a RUNTIME path, and
+// weir command heads must be LITERAL, so this goes through `sh -c` with
+// the path single-quoted [FINDING: forced fallback].
+let runCallback script env args =
+    let quoted = args |> Seq.map (fun a -> $"'{a}'") |> Str.join " "
+    let line = $"'{script}' {quoted}"
+    $env(sh -c $"{line}")
+
+let execPaths plugin version =
+    let ppath = pluginPath plugin
+    let spec = specOf version
+    let ipath = installPath plugin spec
+    let listBinPaths = $"{ppath}/bin/list-bin-paths"
+    // install_type/version for the callback env, per list_plugin_bin_paths
+    let (itype, iver) =
+        match spec with
+        | Ref r -> ("ref", r)
+        | PathVer p -> ("path", p)
+        | System -> ("version", "system")
+        | Plain v -> ("version", v)
+    let binDirs =
+        if File.exists listBinPaths then
+            let env = Env.ofPairs [
+                ("ASDF_INSTALL_TYPE", itype)
+                ("ASDF_INSTALL_VERSION", iver)
+                ("ASDF_INSTALL_PATH", ipath)
+            ]
+            runCallback listBinPaths env []
+            |> Seq.collect Str.fields
+        else ["bin"]
+    binDirs |> Seq.map (fun b -> $"{ipath}/{b}")
+
+let listAll plugin =
+    let script = $"{pluginPath plugin}/bin/list-all"
+    let env = Env.ofPairs []
+    runCallback script env [] |> Seq.collect Str.fields
+
+// ---- messages ---------------------------------------------------------
+
+let noVersionSetText plugin =
+    $"No version is set for {plugin}; please run `asdf <global | shell | local> {plugin} <version>`"
+
+let versionNotInstalledText plugin version =
+    $"version {version} is not installed for {plugin}"
+
+// ---- shims (for `which`) ----------------------------------------------
+
+let shimVersions shimName =
+    let shimPath = $"{dataDir ()}/shims/{shimName}"
+    if File.exists shimPath then
+        File.read shimPath
+        |> Seq.choose (fun l ->
+            match l with
+            | Regex @"^# asdf-plugin: (\S+) (.+)$" (p, v) -> Some (p, v)
+            | _ -> None)
+    else []
+
+let selectVersion shimName =
+    let markers = shimVersions shimName |> Seq.force
+    // the distinct plugins this shim serves, in first-seen order
+    let plugins = markers |> Seq.map fst |> Seq.distinct
+    let startDir = pwd |> Seq.exactlyOne
+    // for each plugin, each of its SET versions; take the first pair the
+    // shim actually carries a marker for (select_version's nested loop)
+    plugins
+    |> Seq.tryPick (fun plugin ->
+        let set = findVersions plugin startDir |> _.versions
+        set
+        |> Seq.tryPick (fun ver ->
+            // a shim marker match, OR a path: version (asdf accepts path
+            // versions unconditionally in select_version)
+            let carried = markers |> Seq.exists (fun (mp, mv) -> mp == plugin && mv == ver)
+            if carried || (ver |> Str.startsWith "path:") then Some (plugin, ver)
+            else None))
+
+let whichExecutable shimName =
+    match selectVersion shimName with
+    | None -> None
+    | Some (plugin, version) ->
+        // command -v under exec-paths-prepended PATH: find an executable
+        // file named `shimName` in the plugin's exec paths
+        execPaths plugin version
+        |> Seq.map (fun d -> $"{d}/{shimName}")
+        |> Seq.tryFind (fun p ->
+            File.exists p && (File.mode p |> Option.map (Str.contains "x") |> Option.defaultValue true))

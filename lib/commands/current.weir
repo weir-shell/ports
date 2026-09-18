@@ -1,0 +1,60 @@
+#!/usr/bin/env weir
+// asdf current [plugin] — ports command-current.bash.
+// Prints a table row per plugin: PLUGIN, VERSION(s), and SET-BY source
+// (the version file path, or a "not installed"/"no version" note). With
+// no plugin, iterates every installed plugin.
+
+import "../core.weir" as Core
+
+// printf "%-15s %-15s %-10s\n" — weir has no Str.padRight [FINDING], so
+// a left-pad helper: append spaces to a minimum width (never truncates,
+// matching printf's %-Ns).
+let padRight w s =
+    let n = w - Str.length s
+    if n <= 0 then s
+    else s + (Seq.replicate n " " |> Str.join "")
+
+// one row, matching bash's terminal_format "%-15s %-15s %-10s\n"
+let row plugin version desc =
+    $"{padRight 15 plugin} {padRight 15 version} {padRight 10 desc}"
+
+// plugin_current_command: resolve, check installs, print the row.
+// Returns the exit status (0 ok, 1 not-installed, 126 no-version).
+let currentFor plugin =
+    if not (Core.pluginExists plugin) then
+        printerr $"No such plugin: {plugin}"
+        exit 1
+    let r = Core.findVersions plugin (pwd |> Seq.exactlyOne)
+    let fullVersion = r.versions |> Str.join " "
+    // any set version not installed?
+    let notInstalled =
+        r.versions
+        |> Seq.tryFind (fun v ->
+            match Core.specOf v with
+            | System -> false
+            | spec -> not (Dir.exists (Core.installPath plugin spec)))
+    match notInstalled with
+    | Some v ->
+        printerr (row plugin fullVersion $"Not installed. Run \"asdf install {plugin} {v}\"")
+        1
+    | None ->
+        if fullVersion == "" then
+            printerr (row plugin "______" $"No version is set. Run \"asdf <global|shell|local> {plugin} <version>\"")
+            126
+        else
+            print (row plugin fullVersion r.source)
+            0
+
+let args = Self.args |> Seq.force
+
+if (args |> Seq.length) == 0 then
+    // all plugins; the bash loop path exits 0 regardless of per-plugin
+    // status (current_command only propagates the single-plugin status).
+    for p in Core.pluginList () do
+        let _s = (currentFor p)
+        print ()
+    exit 0
+
+let plugin = args |> Seq.item 0
+let status = (currentFor plugin)
+exit status
