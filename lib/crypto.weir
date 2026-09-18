@@ -1,0 +1,162 @@
+module Crypto
+
+import "./encoding.weir" as Enc
+
+// The CRYPTO BOUNDARY of the ACME core, ported from acme.sh v3.1.5:
+//   _calcjwk  -> JWK construction (openssl extracts key material; weir assembles)
+//   _sign     -> _send_signed_request's signature (openssl signs; weir formats)
+//   __calc_account_thumbprint / _digest sha256 -> RFC 7638 thumbprint
+//
+// weir has NO asymmetric signing and NO key parsing, so openssl is the
+// FALLBACK for: (a) extracting RSA modulus/exponent and the EC public point,
+// (b) producing the raw signature. Everything else (JWK JSON, base64url,
+// thumbprint hashing) is pure weir.
+//
+// CANONICAL JSON for RFC 7638: `to json` is compact (no whitespace) for free,
+// and sorted-key is obtained by DECLARING the record fields in the required
+// lexicographic order (to json keeps DECLARATION order — see FINDINGS).
+
+// RFC 7638 required members, in lex order, so `to json` is canonical.
+type RsaJwk = {
+    e: string
+    kty: string
+    n: string
+}
+
+type EcJwk = {
+    crv: string
+    kty: string
+    x: string
+    y: string
+}
+
+/// Extract an RSA public JWK from a PEM key file (openssl fallback).
+/// modulus hex -> n (base64url of raw bytes); public exponent hex -> e.
+let rsaJwk : string -> RsaJwk
+
+let rsaJwk keyfile =
+    let modLine = openssl rsa -in $keyfile -modulus -noout |> Seq.exactlyOne
+    let (_, modHex) = Str.splitOnce "=" modLine
+    // public exponent, e.g. "(0x10001)" -> "10001"; pad to even length.
+    let expRaw =
+        openssl rsa -in $keyfile -noout -text
+        |> Seq.choose (function
+            | Regex @"publicExponent: \d+ \(0x([0-9a-fA-F]+)\)" h -> Some h
+            | _ -> None)
+        |> Seq.exactlyOne
+    let expHex = if (Str.length expRaw) % 2 == 1 then "0" + expRaw else expRaw
+    {
+        e = Enc.hexToB64url expHex
+        kty = "RSA"
+        n = Enc.hexToB64url modHex
+    }
+
+/// Extract an EC public JWK from a PEM key file (openssl fallback).
+/// The raw public point is 0x04 || X || Y; we take the DER SubjectPublicKeyInfo
+/// tail (last 65 bytes for P-256) as hex, then slice X and Y.
+let ecJwk : string -> EcJwk
+
+let ecJwk keyfile =
+    // curve name, e.g. "NIST CURVE: P-256"
+    let crv =
+        openssl ec -in $keyfile -noout -text
+        |> Seq.choose (function
+            | Regex @"NIST CURVE: (\S+)" c -> Some c
+            | _ -> None)
+        |> Seq.exactlyOne
+    // raw point hex: DER pubkey, take tail bytes. For P-256 it is 65 bytes
+    // (0x04 + 32 + 32). We derive the coordinate length from the point.
+    let pointHex =
+        openssl pkey -in $keyfile -pubout -outform DER
+        | od -A n -v -t x1
+        |> Seq.map Str.trim
+        |> Seq.fold (fun acc x -> acc + (Str.replace " " "" x)) ""
+    // the uncompressed point marker 0x04 begins the coordinates; find it as the
+    // final 0x04-prefixed run. For NIST P-curves the SPKI header is fixed, so
+    // the point is the trailing (1 + 2*coordLen) bytes with a leading 04.
+    // P-256 -> 65 bytes (130 hex), P-384 -> 97 (194), P-521 -> 133 (266).
+    let coordHex =
+        match crv with
+        | "P-256" -> 32
+        | "P-384" -> 48
+        | "P-521" -> 66
+        | _ -> fail $"unsupported curve: {crv}"
+    let pointLen = (1 + 2 * coordHex) * 2
+    let total = Str.length pointHex
+    let point = pointHex |> Str.sub (total - pointLen) pointLen
+    // point = "04" + X(coordHex bytes) + Y(coordHex bytes)
+    let xHex = point |> Str.sub 2 (coordHex * 2)
+    let yHex = point |> Str.sub (2 + coordHex * 2) (coordHex * 2)
+    {
+        crv = crv
+        kty = "EC"
+        x = Enc.hexToB64url xHex
+        y = Enc.hexToB64url yHex
+    }
+
+/// RFC 7638 JWK thumbprint of an RSA JWK: SHA-256 of the canonical JSON,
+/// base64url-encoded. Canonical = compact + lex-sorted members (guaranteed by
+/// the record's field order + `to json`).
+let rsaThumbprint : RsaJwk -> string
+
+let rsaThumbprint jwk =
+    jwk |> to json |> Seq.exactlyOne |> Str.sha256 |> Enc.hexToB64url
+
+/// RFC 7638 JWK thumbprint of an EC JWK.
+let ecThumbprint : EcJwk -> string
+
+let ecThumbprint jwk =
+    jwk |> to json |> Seq.exactlyOne |> Str.sha256 |> Enc.hexToB64url
+
+// ---- signing (openssl fallback) ----
+
+/// Sign the JWS signing input (`<protected>.<payload>`) with an RSA key,
+/// producing the base64url RS256 signature. openssl emits raw PKCS#1 bytes;
+/// we base64url them. The signing input is written to a temp file to avoid
+/// shell-quoting the (non-secret) bytes on argv.
+let signRs256 : string -> string -> string
+
+let signRs256 keyfile signingInput =
+    let tmp = Path.newTempDir ()
+    let inFile = $"{tmp}/input"
+    let sigFile = $"{tmp}/sig.bin"
+    [signingInput] |> File.write inFile
+    // openssl dgst -sha256 -sign key -out sig input
+    let _r = openssl dgst -sha256 -sign $keyfile -out $sigFile $inFile | orFail "openssl sign failed"
+    let sig = File.readBytes sigFile |> Enc.bytesToB64url
+    Dir.deleteAll tmp
+    sig
+
+/// Sign with an EC key (ES256/384/512). openssl emits a DER ECDSA signature
+/// (SEQUENCE of r,s); JWS needs the fixed-width R||S concatenation. We parse r
+/// and s out via `openssl asn1parse` (exactly acme.sh's approach), left-pad
+/// each to the coordinate width, and base64url the concatenation.
+let signEs : string -> int -> string -> string
+
+let signEs keyfile coordLen signingInput =
+    let tmp = Path.newTempDir ()
+    let inFile = $"{tmp}/input"
+    let derFile = $"{tmp}/sig.der"
+    [signingInput] |> File.write inFile
+    let hashAlg = $"-sha{coordLen * 8}"
+    let _r = openssl dgst $hashAlg -sign $keyfile -out $derFile $inFile | orFail "openssl EC sign failed"
+    // asn1parse yields two INTEGER lines with ":HEX" tails.
+    let ints =
+        openssl asn1parse -inform DER -in $derFile
+        |> Seq.choose (function
+            | Regex @"INTEGER +:([0-9A-Fa-f]+)" h -> Some (Str.toLower h)
+            | _ -> None)
+        |> Seq.force
+    let width = coordLen * 2
+    let pad h =
+        // left-pad hex to `width`, or trim a leading 00 that DER adds for sign.
+        if (Str.length h) > width then h |> Str.sub ((Str.length h) - width) width
+        else
+            let need = width - (Str.length h)
+            let zeros = Seq.replicate need "0" |> Seq.fold (fun a x -> a + x) ""
+            zeros + h
+    let rHex = pad (Seq.item 0 ints)
+    let sHex = pad (Seq.item 1 ints)
+    let sig = Enc.hexToB64url (rHex + sHex)
+    Dir.deleteAll tmp
+    sig

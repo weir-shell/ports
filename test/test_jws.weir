@@ -1,0 +1,105 @@
+#!/usr/bin/env weir
+import "../lib/encoding.weir" as Enc
+import "../lib/crypto.weir" as Crypto
+import "../lib/jws.weir" as Jws
+
+// Crypto acceptance: build a JWS with weir, VERIFY it with openssl (the oracle).
+// Also cross-check JWK thumbprints weir-vs-openssl for RSA and EC keys.
+// Keys live in test/ (ec.key, rsa.key) — see gen_keys.sh.
+
+let dir = Self.scriptPath |> Path.dir
+let ecKey = $"{dir}/ec.key"
+let rsaKey = $"{dir}/rsa.key"
+
+let check name ok =
+    if ok then print $"ok   {name}"
+    else
+        print $"FAIL {name}"
+        fail $"assertion failed: {name}"
+
+type FlatIn = { protected: string; payload: string; signature: string }
+
+// ============ JWK thumbprint cross-check vs openssl ============
+// Oracle: write the EXACT canonical JSON bytes (no trailing newline) to a file
+// via File.writeBytes, hash with openssl, base64url. A value-head stdin pipe
+// would append a newline and corrupt the digest, so we go byte-exact.
+let tp = Path.newTempDir ()
+let osslThumb canon =
+    let f = $"{tp}/canon"
+    Str.toUtf8 canon |> File.writeBytes f
+    openssl dgst -sha256 -binary $f | openssl base64 -A
+    |> Seq.exactlyOne
+    |> Enc.b64ToB64url
+
+let ecj = Crypto.ecJwk ecKey
+let ecThumb = Crypto.ecThumbprint ecj
+let ecCanon = ecj |> to json |> Seq.exactlyOne
+check "EC thumbprint == openssl oracle" (ecThumb == osslThumb ecCanon)
+
+let rsaj = Crypto.rsaJwk rsaKey
+let rsaThumb = Crypto.rsaThumbprint rsaj
+let rsaCanon = rsaj |> to json |> Seq.exactlyOne
+check "RSA thumbprint == openssl oracle" (rsaThumb == osslThumb rsaCanon)
+Dir.deleteAll tp
+
+// Also sanity: JWK JSON is canonical (compact + sorted members).
+check "EC JWK is canonical" (ecCanon |> Str.startsWith "{\"crv\":")
+check "RSA JWK is canonical" (rsaCanon |> Str.startsWith "{\"e\":")
+
+// ============ JWS build + openssl verify ============
+let nonce = "taro4LZUj3t9G4pxrOFZBZCtzhOhmqBLYb_0jGP2fLo"
+let url = "https://acme-staging-v02.api.letsencrypt.org/acme/new-account"
+let payload = @"{""termsOfServiceAgreed"":true}"
+let tmp = Path.newTempDir ()
+
+// ---- RSA (RS256): deterministic, so we byte-match AND openssl-verify ----
+let rsaJwkJson = rsaj |> to json |> Seq.exactlyOne
+let rsaProtected = $"{{\"nonce\":\"{nonce}\",\"url\":\"{url}\",\"alg\":\"RS256\",\"jwk\":{rsaJwkJson}}}"
+let rsaJws = Jws.signRsa rsaKey rsaProtected payload
+let rsaParsed = [rsaJws] |> from json FlatIn
+let rsaInput = $"{rsaParsed.protected}.{rsaParsed.payload}"
+
+[rsaInput] |> File.write $"{tmp}/rin"
+let _s1 = openssl dgst -sha256 -sign $rsaKey -out $"{tmp}/rsig" $"{tmp}/rin" | orFail "oracle rsa sign"
+let rOracle = File.readBytes $"{tmp}/rsig" |> Enc.bytesToB64url
+check "RSA JWS sig byte-matches openssl (deterministic)" (rsaParsed.signature == rOracle)
+
+let _pub = openssl rsa -in $rsaKey -pubout -out $"{tmp}/rpub" | orFail "rsa pubout"
+Enc.b64urlToBytes rsaParsed.signature |> File.writeBytes $"{tmp}/rsig2"
+let rVerify = openssl dgst -sha256 -verify $"{tmp}/rpub" -signature $"{tmp}/rsig2" $"{tmp}/rin" | succeeds
+check "RSA JWS openssl-verifies" rVerify
+
+// ---- EC (ES256): non-deterministic; reconstruct DER and openssl-verify ----
+let ecJwkJson = ecj |> to json |> Seq.exactlyOne
+let ecProtected = $"{{\"nonce\":\"{nonce}\",\"url\":\"{url}\",\"alg\":\"ES256\",\"jwk\":{ecJwkJson}}}"
+let ecJws = Jws.signEc ecKey 32 ecProtected payload
+let ecParsed = [ecJws] |> from json FlatIn
+let ecInput = $"{ecParsed.protected}.{ecParsed.payload}"
+
+let ecSigBytes = Enc.b64urlToBytes ecParsed.signature
+check "EC JWS sig is 64 bytes (R||S)" (Bytes.length ecSigBytes == 64B)
+
+// Rebuild DER SEQUENCE{ INTEGER r, INTEGER s } from R||S hex, then verify.
+let ecSigHex = Enc.bytesToHex ecSigBytes
+let rHex = ecSigHex |> Str.sub 0 64
+let sHex = ecSigHex |> Str.sub 64 64
+// DER INTEGER: if high bit set, prepend 00. Build hex for one integer.
+let derInt h =
+    let firstByte = h |> Str.sub 0 2
+    let needsPad = (Enc.hexDigit (firstByte |> Str.sub 0 1)) >= 8
+    let body = if needsPad then "00" + h else h
+    let len = (Str.length body) / 2
+    "02" + (Enc.byteToHex len) + body
+let rDer = derInt rHex
+let sDer = derInt sHex
+let seqBody = rDer + sDer
+let seqLen = (Str.length seqBody) / 2
+let derHex = "30" + (Enc.byteToHex seqLen) + seqBody
+Enc.b64urlToBytes (Enc.hexToB64url derHex) |> File.writeBytes $"{tmp}/ecsig"
+[ecInput] |> File.write $"{tmp}/ecin"
+let _ecpub = openssl ec -in $ecKey -pubout -out $"{tmp}/ecpub" | orFail "ec pubout"
+let ecVerify = openssl dgst -sha256 -verify $"{tmp}/ecpub" -signature $"{tmp}/ecsig" $"{tmp}/ecin" | succeeds
+check "EC JWS openssl-verifies (DER-reconstructed)" ecVerify
+
+Dir.deleteAll tmp
+print "all JWS/crypto tests passed"
