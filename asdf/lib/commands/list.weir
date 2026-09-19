@@ -6,14 +6,14 @@
 
 import "../core.weir" as Core
 
-let args = Self.args |> Seq.force
+let args = Self.args |> Seq.freeze
 let plugin = args |> Seq.tryItem 0 |> Option.defaultValue ""
 let query = args |> Seq.tryItem 1 |> Option.defaultValue ""
 
 // display_installed_versions: print each installed version with a flag,
 // "*" when it equals the current preset version. Ports the function.
 let displayInstalled name =
-    let all = Core.installedVersions name |> Seq.force
+    let all = Core.installedVersions name |> Seq.freeze
     // query filter: grep -E "^\s*<query>" (a leading-anchored prefix)
     let versions =
         if query == "" then all
@@ -43,7 +43,7 @@ if plugin <> "" then
     exit 0
 
 // no plugin given: list all plugins with their installed versions
-let plugins = Core.pluginList () |> Seq.force
+let plugins = Core.pluginList () |> Seq.freeze
 if plugins |> Seq.isEmpty then
     print "No plugins installed"
     exit 0

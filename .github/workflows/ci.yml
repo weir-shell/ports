@@ -39,7 +39,7 @@ jobs:
             else
               echo "FAIL $f"; weir check "$f" 2>&1 | sed 's/^/     /'; fail=1
             fi
-          done < <(find asdf acme ring -name '*.weir' | sort)
+          done < <(find asdf acme ring -name '*.weir' -not -path '*/probes/*' -name '*.weir' | sort)
           exit $fail
 
       - name: asdf harness

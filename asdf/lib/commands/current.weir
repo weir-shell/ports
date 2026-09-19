@@ -45,7 +45,7 @@ let currentFor plugin =
             print (row plugin fullVersion r.source)
             0
 
-let args = Self.args |> Seq.force
+let args = Self.args |> Seq.freeze
 
 if (args |> Seq.length) == 0 then
     // all plugins; the bash loop path exits 0 regardless of per-plugin

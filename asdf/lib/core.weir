@@ -219,7 +219,7 @@ let parseToolVersions lines =
     lines
     |> stripComments
     |> Seq.choose (fun l ->
-        match l |> Str.fields |> Seq.force with
+        match l |> Str.fields |> Seq.freeze with
         | [] -> None
         | name :: vers -> Some { plugin = name; versions = vers })
 
@@ -281,7 +281,7 @@ let findVersions plugin startDir =
             searchDirs startDir
             |> Seq.map (fun d -> $"{d}/{fname}")
             |> Seq.tryPick (fun path ->
-                let vs = versionsFor (readRows path) plugin |> Seq.force
+                let vs = versionsFor (readRows path) plugin |> Seq.freeze
                 if vs |> Seq.isEmpty then None else Some (vs, path))
         match hit with
         | Some (vs, path) -> { versions = vs; source = path; found = true }
@@ -290,7 +290,7 @@ let findVersions plugin startDir =
             // absolute path (asdf checks it verbatim as a file)
             match Env.get "ASDF_DEFAULT_TOOL_VERSIONS_FILENAME" with
             | Some abs when File.exists abs ->
-                let vs = versionsFor (readRows abs) plugin |> Seq.force
+                let vs = versionsFor (readRows abs) plugin |> Seq.freeze
                 if vs |> Seq.isEmpty then { versions = []; source = ""; found = false }
                 else { versions = vs; source = abs; found = true }
             | _ -> { versions = []; source = ""; found = false }
@@ -391,7 +391,7 @@ let shimVersions shimName =
     else []
 
 let selectVersion shimName =
-    let markers = shimVersions shimName |> Seq.force
+    let markers = shimVersions shimName |> Seq.freeze
     // the distinct plugins this shim serves, in first-seen order
     let plugins = markers |> Seq.map fst |> Seq.distinct
     let startDir = pwd |> Seq.exactlyOne

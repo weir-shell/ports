@@ -115,8 +115,8 @@ let results =
     cases
     |> Seq.map (fun c ->
         let r = runPorted c.cmd c.argv
-        let gotOut = r.stdout |> Seq.force
-        let wantOut = c.stdout |> Seq.force
+        let gotOut = r.stdout |> Seq.freeze
+        let wantOut = c.stdout |> Seq.freeze
         let outOk = seqEq gotOut wantOut
         let codeOk = r.exitCode == c.code
         // oracle cross-check (stdout only), when requested and available
@@ -124,7 +124,7 @@ let results =
             if (c.oracle |> Seq.isEmpty) || not haveOracle then true
             else
                 let o = runOracle c.oracle
-                seqEq (o.stdout |> Seq.force) wantOut
+                seqEq (o.stdout |> Seq.freeze) wantOut
         let pass = outOk && codeOk && oracleOk
         if not pass then
             printerr $"FAIL: {c.name}"
@@ -136,7 +136,7 @@ let results =
         else
             print $"ok: {c.name}"
         pass)
-    |> Seq.force
+    |> Seq.freeze
 
 let passed = results |> Seq.where (fun b -> b) |> Seq.length
 let total = results |> Seq.length

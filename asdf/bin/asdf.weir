@@ -6,9 +6,9 @@
 // as a child, forwarding argv — the plugins-as-programs discipline
 // applied to our own commands too.
 
-let args = Self.args |> Seq.force
+let args = Self.args |> Seq.freeze
 let sub = args |> Seq.tryItem 0 |> Option.defaultValue ""
-let rest = args |> Seq.skip 1 |> Seq.force
+let rest = args |> Seq.skip 1 |> Seq.freeze
 
 // command scripts live beside this file, under ../lib/commands
 let cmdDir = Path.combine (Path.dir Self.scriptPath) "../lib/commands"

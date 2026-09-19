@@ -5,7 +5,7 @@
 
 import "../core.weir" as Core
 
-let args = Self.args |> Seq.force
+let args = Self.args |> Seq.freeze
 let plugin = args |> Seq.tryItem 0 |> Option.defaultValue ""
 let fullVersion = args |> Seq.tryItem 1 |> Option.defaultValue ""
 

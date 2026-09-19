@@ -146,7 +146,7 @@ let signEs keyfile coordLen signingInput =
         |> Seq.choose (function
             | Regex @"INTEGER +:([0-9A-Fa-f]+)" h -> Some (Str.toLower h)
             | _ -> None)
-        |> Seq.force
+        |> Seq.freeze
     let width = coordLen * 2
     let pad h =
         // left-pad hex to `width`, or trim a leading 00 that DER adds for sign.
