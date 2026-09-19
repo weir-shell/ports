@@ -1,0 +1,47 @@
+#!/usr/bin/env weir
+import "../lib/encoding.weir" as Enc
+
+// Known-answer tests for the encoding layer.
+
+let check name got want =
+    if got == want then
+        print $"ok   {name}"
+    else
+        print $"FAIL {name}: got {got} want {want}"
+        fail $"KAT failed: {name}"
+
+// --- base64url on text ---
+// RFC 7515 Appendix C worked example: {"typ":"JWT",...} not needed;
+// use a simple deterministic check. "hello" -> base64 "aGVsbG8=" -> url "aGVsbG8"
+check "textToB64url hello" (Enc.textToB64url "hello") "aGVsbG8"
+
+// bytes with +/ and padding: 0xFB 0xFF 0xBF -> base64 "+/+/" -> url "-_-_"
+// 0xFB=251,0xFF=255,0xBF=191 -> "+/+/". Feed as hex.
+check "b64url +/ -> -_" (Enc.hexToB64url "fbffbf") "-_-_"
+
+// padding strip: "f" (0x66) -> base64 "Zg==" -> url "Zg"
+check "pad strip" (Enc.hexToB64url "66") "Zg"
+
+// --- base64url round-trip back to bytes (via standard base64) ---
+check "b64url roundtrip -> b64" (Enc.b64urlToB64 "aGVsbG8") "aGVsbG8="
+check "b64url roundtrip -> b64 2pad" (Enc.b64urlToB64 "Zg") "Zg=="
+
+// --- hex encoding pieces ---
+check "byteToHex 255" (Enc.byteToHex 255) "ff"
+check "byteToHex 0" (Enc.byteToHex 0) "00"
+check "byteToHex 171" (Enc.byteToHex 171) "ab"
+
+// hex -> standard base64 sanity: "68656c6c6f" ("hello") -> "aGVsbG8="
+check "hexToB64 hello" (Enc.hexToB64 "68656c6c6f") "aGVsbG8="
+
+// --- JWK thumbprint known-answer (RFC 7638 style, EC P-256 example JWK) ---
+// A FIXED canonical EC JWK (members lex-sorted: crv,kty,x,y; whitespace-free).
+// Thumbprint = base64url(SHA-256(canonical JSON)). Pinned against openssl
+// offline (printf '%s' JWK | openssl dgst -sha256 -binary | base64 | url-tr).
+// This exercises the full chain Str.sha256 (hex) -> hexToB64url.
+let ecJwkCanon =
+    "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+let ecThumb = ecJwkCanon |> Str.sha256 |> Enc.hexToB64url
+check "EC JWK thumbprint (pinned KAT)" ecThumb "oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"
+
+print "all encoding KATs passed"

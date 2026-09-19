@@ -1,0 +1,64 @@
+module Jws
+
+import "./encoding.weir" as Enc
+import "./crypto.weir" as Crypto
+
+// JWS / signed-request assembly, ported from acme.sh's _send_signed_request
+// (v3.1.5, lines 2461-2600). The flattened JWS JSON is:
+//   { "protected": <b64url>, "payload": <b64url>, "signature": <b64url> }
+// where the signing input is  "<protected64>.<payload64>"  and the signature
+// is over that ASCII string.
+//
+// acme.sh builds `protected` by string-concatenation of a nonce/url/alg/kid
+// (or jwk) template. Here the protected header is a typed record so `to json`
+// emits it; field ORDER follows acme.sh's wire order (nonce, url, alg, then
+// jwk/kid) for byte-comparable envelopes.
+
+// The flattened JWS document (what gets POSTed).
+type FlatJws = {
+    [<Wire "protected">]
+    protectedField: string
+    payload: string
+    signature: string
+}
+
+/// Build the signing input `<protected64>.<payload64>` from raw JSON strings.
+let signingInput : string -> string -> string
+
+let signingInput protectedJson payloadJson =
+    let p64 = Enc.textToB64url protectedJson
+    let pl64 = Enc.textToB64url payloadJson
+    $"{p64}.{pl64}"
+
+/// Assemble the flattened JWS given the already-base64url protected & payload
+/// and the base64url signature.
+let flatten : string -> string -> string -> string
+
+let flatten protected64 payload64 sig =
+    let doc = {
+        protectedField = protected64
+        payload = payload64
+        signature = sig
+    }
+    doc |> to json |> Seq.exactlyOne
+
+/// Sign a protected+payload with an RSA key, returning the flattened JWS JSON.
+let signRsa : string -> string -> string -> string
+
+let signRsa keyfile protectedJson payloadJson =
+    let p64 = Enc.textToB64url protectedJson
+    let pl64 = Enc.textToB64url payloadJson
+    let input = $"{p64}.{pl64}"
+    let sig = Crypto.signRs256 keyfile input
+    flatten p64 pl64 sig
+
+/// Sign a protected+payload with an EC key (coordLen: 32=ES256, 48=ES384,
+/// 66=ES512), returning the flattened JWS JSON.
+let signEc : string -> int -> string -> string -> string
+
+let signEc keyfile coordLen protectedJson payloadJson =
+    let p64 = Enc.textToB64url protectedJson
+    let pl64 = Enc.textToB64url payloadJson
+    let input = $"{p64}.{pl64}"
+    let sig = Crypto.signEs keyfile coordLen input
+    flatten p64 pl64 sig

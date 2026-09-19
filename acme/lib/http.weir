@@ -1,0 +1,61 @@
+module Http
+
+// HTTP layer + ACME directory/nonce, ported from acme.sh v3.1.5:
+//   _get / _post  -> curl/wget wrappers that string-parse a header FILE
+//   nonce extraction -> `grep -i Replay-Nonce: | cut -d ':' -f 2`
+//   directory parse -> `_egrep_o 'newNonce" *: *"[^"]*"' | cut -d '"' -f 3`
+//
+// weir's Http.send returns a TYPED response (status:int, headers:pairs,
+// body), and `from json` reads the directory into a typed record — replacing
+// the entire curl-wrapper + $HTTP_HEADER + grep/cut/sed apparatus.
+
+// The ACME directory document (RFC 8555 section 7.1.1). Only the resource
+// URLs we need for Stage 1; `meta` is read as an opaque nested record.
+type DirMeta = {
+    termsOfService: Option<string>
+    website: Option<string>
+}
+
+type Directory = {
+    newNonce: string
+    newAccount: string
+    newOrder: string
+    revokeCert: string
+    keyChange: string
+    meta: Option<DirMeta>
+}
+
+/// Fetch and parse the ACME directory (a real, read-only GET).
+let fetchDirectory : string -> Directory
+
+let fetchDirectory url =
+    let resp = Http.send (Http.get url)
+    if resp.status >= 400 then fail $"directory GET failed: {resp.status}"
+    resp.body |> from json Directory
+
+/// Parse a directory document from already-fetched JSON lines (the fixture
+/// path, for offline runs — identical parse, no network).
+let parseDirectory : seq<string> -> Directory
+
+let parseDirectory lines = lines |> from json Directory
+
+/// Case-insensitive header lookup over the response's header pairs. Replaces
+/// acme.sh's `grep -i "Replay-Nonce:" | cut -d ':' -f 2`.
+let header : seq<string * string> -> string -> Option<string>
+
+let header headers name =
+    let lname = Str.toLower name
+    headers
+    |> Seq.tryPick (fun (k, v) ->
+        if Str.toLower k == lname then Some v else None)
+
+/// Fetch a fresh Replay-Nonce from the newNonce endpoint (a HEAD request, as
+/// acme.sh does via `_post "" nonceurl "" "HEAD"`).
+let fetchNonce : string -> string
+
+let fetchNonce nonceUrl =
+    let resp = Http.send (Http.head nonceUrl)
+    if resp.status >= 400 then fail $"newNonce failed: {resp.status}"
+    match header resp.headers "Replay-Nonce" with
+    | Some n -> n
+    | None -> fail "no Replay-Nonce header in newNonce response"
