@@ -128,13 +128,15 @@ let procGeneration s id p =
             | Dead ->
                 writeVerdict s id "halt"
             | _ ->
-                if Proc.running child then
-                    writeVerdict s id "halt"
-                else
+                let died = not (Proc.running child)
+                if died then
                     let code = Proc.wait child
                     let last = Proc.tail child |> Seq.tryLast |> Option.defaultValue "<no output>"
                     print $"           {Life.pad 12 id} exited (code {show code}), last output: {last}"
+                if died && Instant.now () < s.deadline then
                     writeVerdict s id "recover"
+                else
+                    writeVerdict s id "halt"
         always
             Life.fire s.life id Life.Stop
     readVerdict s id
