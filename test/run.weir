@@ -1,0 +1,160 @@
+#!/usr/bin/env weir
+// ring-weir Stage 1 acceptance harness. Run via test/run.sh (it puts the
+// freeze weir binary and the docker-compose stub on PATH and cds to the repo
+// root). Asserts lifecycle transitions, restart policy, graceful shutdown
+// (SIGTERM), the compose backend against a stub oracle, and no orphans.
+
+import "../src/lifecycle.weir" as Life
+
+let ok msg = print $"ok - {msg}"
+
+let assertTrue msg b =
+    if b then ok msg else fail $"FAIL: {msg}"
+
+let eventsFor sd id =
+    File.read $"{sd}/events.log"
+        |> Seq.choose (fun l ->
+            match l |> Str.split " " |> Seq.freeze with
+            | [_; i; ev; _] -> if i == id then Some ev else None
+            | _ -> None)
+        |> Seq.freeze
+
+let countOf evs name =
+    evs |> Seq.where (fun e -> e == name) |> Seq.length
+
+let noOrphans msg =
+    let pg = pgrep -f ring-stub | complete
+    assertTrue msg (pg.exitCode == 1)
+
+let stateIs sd id name =
+    Life.protoStateOf (Life.stateOf (Life.Ctx { stateDir = sd }) id) == name
+
+// ---- 1: the transition table (the Stateless FSM as data) ----
+
+let t1 = match Life.transition Life.Zero Life.Init with | Goto Idle -> true | _ -> false
+assertTrue "Zero +Init -> Idle" t1
+let t2 = match Life.transition Life.ProbingHealth Life.HcUnhealthy with | Goto Recovering -> true | _ -> false
+assertTrue "ProbingHealth +HcUnhealthy -> Recovering" t2
+let t3 = match Life.transition Life.ProbingHealth Life.HcDead with | Goto Dead -> true | _ -> false
+assertTrue "ProbingHealth +HcDead -> Dead" t3
+let t4 = match Life.transition Life.Healthy Life.HealthLoop with | Goto ProbingHealth -> true | _ -> false
+assertTrue "Healthy +HealthLoop -> ProbingHealth" t4
+let t5 = match Life.transition Life.Dead Life.Start with | Refused -> true | _ -> false
+assertTrue "Dead +Start refused (Stateless would throw)" t5
+let t6 = match Life.transition Life.Idle Life.HcOk with | Stay -> true | _ -> false
+assertTrue "Idle +HcOk ignored" t6
+
+// ---- 2: deadline run - full lifecycle, restart on death, clean stop ----
+
+let sd2 = Path.newTempDir ()
+let r2 = weir ring.weir run -w test/fixtures/demo.yaml --run-for 4s --health-period 500ms --state-dir $sd2 | complete
+assertTrue "deadline run exits 0" (r2.exitCode == 0)
+let steady = eventsFor sd2 "steady"
+let flaky = eventsFor sd2 "flaky"
+assertTrue "steady: INITIATED" (steady |> Seq.contains "RUNNABLE_INITIATED")
+assertTrue "steady: STARTED" (steady |> Seq.contains "RUNNABLE_STARTED")
+assertTrue "steady: HEALTHY" (steady |> Seq.contains "RUNNABLE_HEALTHY")
+assertTrue "steady: never recovers" (countOf steady "RUNNABLE_RECOVERING" == 0)
+assertTrue "steady: STOPPED then DESTROYED" ((steady |> Seq.rev |> Seq.take 2 |> Str.join ",") == "RUNNABLE_DESTROYED,RUNNABLE_STOPPED")
+assertTrue "flaky: recovered at least once" (countOf flaky "RUNNABLE_RECOVERING" >= 1)
+assertTrue "flaky: restarted (STARTED >= 2)" (countOf flaky "RUNNABLE_STARTED" >= 2)
+assertTrue "flaky: destroyed once" (countOf flaky "RUNNABLE_DESTROYED" == 1)
+assertTrue "steady: final state ZERO" (stateIs sd2 "steady" "ZERO")
+assertTrue "flaky: final state ZERO" (stateIs sd2 "flaky" "ZERO")
+noOrphans "deadline run leaves no orphans"
+
+// ---- 3: SIGTERM mid-run - the graceful shutdown headline ----
+
+let sd3 = Path.newTempDir ()
+within proc sup = weir ring.weir run -w test/fixtures/demo.yaml --run-for 120s --health-period 500ms --state-dir $sd3
+    poll timeout=20s interval=200ms
+        File.exists $"{sd3}/events.log"
+            && (eventsFor sd3 "steady" |> Seq.contains "RUNNABLE_HEALTHY")
+            && (eventsFor sd3 "flaky" |> Seq.contains "RUNNABLE_HEALTHY")
+    ok "supervisor reports both runnables healthy"
+    let statusOut = weir ring.weir status -s $sd3 |> Seq.freeze
+    assertTrue "status: lists steady" (statusOut |> Seq.exists (Str.startsWith "steady"))
+    assertTrue "status: workspace line present" (statusOut |> Seq.exists (Str.startsWith "workspace:"))
+    let pid = Proc.pid sup
+    kill -TERM $pid
+    poll timeout=15s interval=200ms
+        not (Proc.running sup)
+    let code = Proc.wait sup
+    assertTrue "SIGTERM: supervisor exits 143 after teardown" (code == 143)
+    assertTrue "SIGTERM: steady stopped" (eventsFor sd3 "steady" |> Seq.contains "RUNNABLE_STOPPED")
+    assertTrue "SIGTERM: steady destroyed" (eventsFor sd3 "steady" |> Seq.contains "RUNNABLE_DESTROYED")
+    assertTrue "SIGTERM: flaky destroyed" (eventsFor sd3 "flaky" |> Seq.contains "RUNNABLE_DESTROYED")
+    assertTrue "SIGTERM: steady final ZERO" (stateIs sd3 "steady" "ZERO")
+    assertTrue "SIGTERM: flaky final ZERO" (stateIs sd3 "flaky" "ZERO")
+    noOrphans "SIGTERM leaves no orphans"
+
+// ---- 4: import tree + compose stub oracle + env/workdir plumbing ----
+
+let sd4 = Path.newTempDir ()
+let scratch = Path.newTempDir ()
+let dcLog = Path.combine scratch "dc.log"
+let envOut = Path.combine scratch "env.out"
+let pwdOut = Path.combine scratch "pwd.out"
+let ev4 = Env.ofPairs [
+    ("RING_DC_LOG", dcLog)
+    ("RING_ENV_OUT", envOut)
+    ("RING_PWD_OUT", pwdOut)
+]
+
+within env ev4
+    let r4 = weir ring.weir run -w test/fixtures/root.yaml --run-for 4s --health-period 500ms --state-dir $sd4 | complete
+    assertTrue "root run exits 0" (r4.exitCode == 0)
+
+let ids4 = File.read $"{sd4}/ids" |> Seq.freeze
+assertTrue "imports: all 4 runnables loaded" ((ids4 |> Seq.length) == 4 && (ids4 |> Seq.contains "dc-main"))
+let dcm = eventsFor sd4 "dc-main"
+assertTrue "dc-main: full lifecycle" ((dcm |> Seq.contains "RUNNABLE_HEALTHY") && (dcm |> Seq.contains "RUNNABLE_DESTROYED"))
+let verbs =
+    File.read dcLog
+        |> Seq.map (fun l -> l |> Str.split " " |> Seq.item 3)
+        |> Str.join ","
+assertTrue "compose oracle: rm,pull,up,stop,down in order" (verbs == "rm,pull,up,stop,down")
+assertTrue "workspace env reaches child, runnable env wins" ((File.read envOut |> Seq.exactlyOne) == "from-workspace:from-config")
+assertTrue "workingDir honoured" (File.read pwdOut |> Seq.exactlyOne |> Str.endsWith "/dc")
+noOrphans "root run leaves no orphans"
+
+// ---- 5: a dying compose client is DEAD, never recovered (ring parity) ----
+
+let sd5 = Path.newTempDir ()
+let dcLog5 = Path.combine scratch "dc5.log"
+let ev5 = Env.ofPairs [
+    ("RING_DC_LOG", dcLog5)
+    ("RING_DC_UP_SECS", "1")
+]
+
+within env ev5
+    let r5 = weir ring.weir run -w test/fixtures/compose.yaml --run-for 8s --health-period 500ms --state-dir $sd5 | complete
+    assertTrue "dead-compose run exits 0" (r5.exitCode == 0)
+
+let dcm5 = eventsFor sd5 "dc-main"
+assertTrue "dead compose: UNRECOVERABLE pushed" (dcm5 |> Seq.contains "RUNNABLE_UNRECOVERABLE")
+assertTrue "dead compose: no recovery attempted" (countOf dcm5 "RUNNABLE_RECOVERING" == 0)
+assertTrue "dead compose: still stopped+destroyed" (dcm5 |> Seq.contains "RUNNABLE_DESTROYED")
+
+// ---- 6: --max-recoveries escalates Unhealthy to Dead (ring's threshold law) ----
+
+let sd6 = Path.newTempDir ()
+let r6 = weir ring.weir run -w test/fixtures/flaky.yaml --run-for 30s --health-period 500ms --max-recoveries 2 --state-dir $sd6 | complete
+assertTrue "capped run exits 0 (early, workspace fully dead)" (r6.exitCode == 0)
+let flaky6 = eventsFor sd6 "flaky"
+assertTrue "capped: exactly 2 recoveries" (countOf flaky6 "RUNNABLE_RECOVERING" == 2)
+assertTrue "capped: 3 generations" (countOf flaky6 "RUNNABLE_STARTED" == 3)
+assertTrue "capped: then UNRECOVERABLE" (countOf flaky6 "RUNNABLE_UNRECOVERABLE" == 1)
+assertTrue "capped: final ZERO" (stateIs sd6 "flaky" "ZERO")
+noOrphans "capped run leaves no orphans"
+
+// ---- 7: stub arms teach instead of running ----
+
+let r7 = weir ring.weir run -w test/fixtures/dotnet-urls.yaml --run-for 1s --state-dir (Path.newTempDir ()) | complete
+assertTrue "dotnet stub run exits 0" (r7.exitCode == 0)
+assertTrue "dotnet stub teaches" (r7.stdout |> Seq.exists (Str.contains "[stub] 'dotnet'"))
+let l7 = weir ring.weir list -w test/fixtures/dotnet-urls.yaml |> Seq.freeze
+assertTrue "list shows the dotnet runnable" (l7 |> Seq.exists (Str.contains "webapp.csproj"))
+
+print ""
+print "ALL GREEN"
