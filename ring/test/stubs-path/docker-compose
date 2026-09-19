@@ -1,0 +1,10 @@
+#!/bin/bash
+log="${RING_DC_LOG:-/dev/null}"
+echo "docker-compose $*" >> "$log"
+for a in "$@"; do
+  case "$a" in
+    up) exec sleep "${RING_DC_UP_SECS:-600}" ;;
+    rm|pull|stop|down) exit 0 ;;
+  esac
+done
+exit 0

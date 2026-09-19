@@ -1,0 +1,14 @@
+// probe: SIGINT unwind WITHOUT piter — single top-level proc scope + always
+let dir = Self.args |> Seq.exactlyOne
+
+within
+    within proc child = sh -c "exec sleep 301"
+        File.append $"{dir}/log" ["started"]
+        within
+            poll timeout=600s interval=100ms
+                not (Proc.running child)
+            print "unreachable"
+        always
+            File.append $"{dir}/log" ["inner-always"]
+always
+    File.append $"{dir}/log" ["top-always"]

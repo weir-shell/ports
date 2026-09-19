@@ -1,0 +1,12 @@
+imports:
+  - demo.yaml
+  - compose.yaml
+env:
+  proc:
+    WS_LEVEL_VAR: from-workspace
+proc:
+  - id: pwddump
+    command: bash
+    workingDir: dc
+    args:
+      - ../stubs/ring-stub-pwd.sh

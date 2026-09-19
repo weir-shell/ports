@@ -1,0 +1,37 @@
+ring (weir, stage 1) workspace=test/fixtures/demo.yaml runnables=2
+state dir: /tmp/ring-demo
+SERVER_RUNNING test/fixtures/demo.yaml
+07:02:15.059Z steady       RUNNABLE_INITIATED       Zero -> Idle
+07:02:15.060Z steady       RUNNABLE_STARTED         Idle -> Pending
+07:02:15.084Z flaky        RUNNABLE_INITIATED       Zero -> Idle
+07:02:15.085Z flaky        RUNNABLE_STARTED         Idle -> Pending
+07:02:16.061Z steady       RUNNABLE_HEALTHY         ProbingHealth -> Healthy
+07:02:16.086Z flaky        RUNNABLE_HEALTHY         ProbingHealth -> Healthy
+07:02:17.087Z flaky        RUNNABLE_RECOVERING      ProbingHealth -> Recovering
+           flaky        exited (code 1), last output: boom
+07:02:17.087Z flaky        RUNNABLE_STOPPED         Recovering -> Idle
+07:02:17.344Z flaky        RUNNABLE_STARTED         Idle -> Pending
+07:02:18.349Z flaky        RUNNABLE_HEALTHY         ProbingHealth -> Healthy
+07:02:19.350Z flaky        RUNNABLE_RECOVERING      ProbingHealth -> Recovering
+           flaky        exited (code 1), last output: boom
+07:02:19.350Z flaky        RUNNABLE_STOPPED         Recovering -> Idle
+07:02:19.607Z flaky        RUNNABLE_STARTED         Idle -> Pending
+07:02:20.609Z flaky        RUNNABLE_HEALTHY         ProbingHealth -> Healthy
+07:02:21.609Z flaky        RUNNABLE_RECOVERING      ProbingHealth -> Recovering
+           flaky        exited (code 1), last output: boom
+07:02:21.609Z flaky        RUNNABLE_STOPPED         Recovering -> Idle
+07:02:21.866Z flaky        RUNNABLE_STARTED         Idle -> Pending
+07:02:22.070Z steady       RUNNABLE_STOPPED         Healthy -> Idle
+07:02:22.084Z steady       RUNNABLE_DESTROYED       Idle -> Zero
+07:02:22.871Z flaky        RUNNABLE_STOPPED         Pending -> Idle
+07:02:22.876Z flaky        RUNNABLE_DESTROYED       Idle -> Zero
+
+=== final states ===
+steady           ZERO (recoveries: 0)
+flaky            ZERO (recoveries: 3)
+WORKSPACE_STOPPED
+SERVER_SHUTDOWN
+--- ring status -s <state-dir> (mid-run, separate process, t+3.5s) ---
+steady           HEALTHY
+flaky            HEALTHY
+workspace: HEALTHY

@@ -1,0 +1,20 @@
+// probe: SIGINT unwind through piter arms with nested proc scopes + always blocks
+let dir = Self.args |> Seq.exactlyOne
+
+let arm n =
+    within
+        within proc child = sh -c $"echo arm-{n}-pid-$$; exec sleep 300"
+            File.append $"{dir}/log" [$"arm{n} started pid={Proc.pid child}"]
+            within
+                poll timeout=600s interval=100ms
+                    not (Proc.running child)
+                print "unreachable"
+            always
+                File.append $"{dir}/log" [$"arm{n} inner-always running={Proc.running child}"]
+    always
+        File.append $"{dir}/log" [$"arm{n} outer-always"]
+
+within
+    ["1"; "2"] |> Seq.piter arm
+always
+    File.append $"{dir}/log" ["top-always"]

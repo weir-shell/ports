@@ -1,0 +1,41 @@
+// probe: nullary union show, retry+until with union verdict, poll bool body
+type RState =
+    | Zero
+    | Idle
+    | Healthy
+
+type Verdict =
+    | Terminal
+    | Recover of int
+
+let parseState s =
+    match s with
+    | "Zero" -> Zero
+    | "Idle" -> Idle
+    | _ -> Healthy
+
+print $"{parseState (show Idle)}"
+
+let counterFile = Path.combine (Path.newTempDir ()) "n"
+["0"] |> File.write counterFile
+
+let bump () =
+    let n = File.read counterFile |> Seq.exactlyOne |> Str.toInt
+    [show (n + 1)] |> File.write counterFile
+    n + 1
+
+let v =
+    retry attempts=5 delay=10ms
+        let n = bump ()
+        if n >= 3 then Terminal else Recover n
+    until r
+        match r with
+        | Terminal -> true
+        | Recover _ -> false
+
+print $"verdict {v}"
+
+let deadline = Instant.now () + 300ms
+poll timeout=5s interval=100ms
+    Instant.now () >= deadline
+print "poll done"

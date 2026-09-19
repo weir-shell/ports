@@ -1,0 +1,6 @@
+dotnet:
+  - csproj: apps/webapp/webapp.csproj
+    urls:
+      - http://+:7123
+    args:
+      - --ring-test-arg=42

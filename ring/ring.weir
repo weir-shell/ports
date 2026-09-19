@@ -1,0 +1,305 @@
+#!/usr/bin/env weir
+// ring, Stage 1: the supervisor core of queil/ring ported to weir.
+// Commands: run (supervise a workspace), list (show runnables), status
+// (read a live supervisor's state dir - the WORKSPACE_INFO_PUBLISH shape).
+
+import "./src/lifecycle.weir" as Life
+import "./src/config.weir" as Config
+
+type RunArgs = {
+    /// workspace file (yaml twin of ring.toml)
+    [<Short "w">]
+    workspace: string
+    /// supervision budget; the run stops cleanly when it elapses
+    [<Default 12h>]
+    runFor: Duration
+    /// health check period (ring: HealthCheckPeriod, default 5s)
+    [<Default 5s>]
+    healthPeriod: Duration
+    /// state/event dir (created; a temp dir when omitted)
+    stateDir: Option<string>
+    /// recoveries before a runnable is declared DEAD (ring restarts procs forever)
+    [<Default 1000000>]
+    maxRecoveries: int
+}
+
+type ListArgs = {
+    /// workspace file (yaml twin of ring.toml)
+    [<Short "w">]
+    workspace: string
+}
+
+type StatusArgs = {
+    /// a running supervisor's state dir
+    [<Short "s">]
+    stateDir: string
+}
+
+type Cmd =
+    | Run of RunArgs
+    | List of ListArgs
+    | Status of StatusArgs
+
+/// one process generation's outcome
+type GenOutcome =
+    | RecoverNext
+    | Halted
+
+type Sup = {
+    life: Ctx
+    period: Duration
+    deadline: Instant
+    maxRecoveries: int
+    wsEnv: EnvByType
+}
+
+// ---- state-dir helpers (the supervisor's only mutable state is files) ----
+
+let recFile s id = Path.combine s.life.stateDir $"recs-{Life.safeId id}"
+
+let readRecs s id =
+    let f = recFile s id
+    if File.exists f then File.read f |> Seq.exactlyOne |> Str.toInt else 0
+
+let bumpRecs s id =
+    [show (readRecs s id + 1)] |> File.write (recFile s id)
+
+let verdictFile s id = Path.combine s.life.stateDir $"verdict-{Life.safeId id}"
+
+let writeVerdict s id v = [v] |> File.write (verdictFile s id)
+
+let readVerdict s id =
+    match File.read (verdictFile s id) |> Seq.exactlyOne with
+    | "recover" -> RecoverNext
+    | _ -> Halted
+
+// ---- proc runnable (Runnables/Proc/ProcRunnable.cs) ----
+
+let shq s = "'" + (s |> Str.replace "'" "'\\''") + "'"
+
+let shellLineFor p =
+    let argv =
+        p.args
+            |> Option.defaultValue []
+            |> Seq.append [p.command]
+            |> Seq.map shq
+            |> Str.join " "
+    let cdPrefix =
+        p.workingDir
+            |> Option.map (fun d -> $"cd {shq d} && ")
+            |> Option.defaultValue ""
+    $"{cdPrefix}exec {argv}"
+
+// ProcessRunnable.CheckHealthAsync: process-alive is the probe. ProcContext
+// has no ITrackRetries in ring, so a proc never escalates to Dead there;
+// --max-recoveries generalizes MaxTotalFailuresUntilDead to procs.
+let probeProc s id child =
+    if Proc.running child then Life.Ok
+    elif readRecs s id >= s.maxRecoveries then Life.Fatal
+    else Life.Unhealthy
+
+let tickProc s id child =
+    if Instant.now () >= s.deadline then true
+    else
+        Life.fire s.life id Life.HealthLoop
+        match probeProc s id child with
+        | Ok ->
+            Life.fire s.life id Life.HcOk
+            false
+        | Unhealthy ->
+            bumpRecs s id
+            Life.fire s.life id Life.HcUnhealthy
+            true
+        | Fatal ->
+            Life.fire s.life id Life.HcDead
+            true
+        | Ignore -> false
+
+let procGeneration s id p =
+    Life.fire s.life id Life.Start
+    let line = shellLineFor p
+    within proc child = sh -c $line
+        within
+            Duration.sleep s.period
+            let budget = (s.deadline - Instant.now ()) + 60s
+            poll { Poll.defaults with timeout = budget; interval = s.period }
+                tickProc s id child
+            match Life.stateOf s.life id with
+            | Dead ->
+                writeVerdict s id "halt"
+            | _ ->
+                let died = not (Proc.running child)
+                if died then
+                    let code = Proc.wait child
+                    let last = Proc.tail child |> Seq.tryLast |> Option.defaultValue "<no output>"
+                    print $"           {Life.pad 12 id} exited (code {show code}), last output: {last}"
+                if died && Instant.now () < s.deadline then
+                    writeVerdict s id "recover"
+                else
+                    writeVerdict s id "halt"
+        always
+            Life.fire s.life id Life.Stop
+    readVerdict s id
+
+let superviseProc s p =
+    let id = p.id |> Option.defaultValue p.command
+    Life.fire s.life id Life.Init
+    let ev = Env.ofPairs (Config.envFor s.wsEnv (Config.Proc p))
+    within
+        within env ev
+            let _last =
+                retry { Retry.defaults with attempts = s.maxRecoveries + 2; delay = 250ms }
+                    procGeneration s id p
+                until v
+                    match v with
+                    | Halted -> true
+                    | RecoverNext -> false
+            ()
+    always
+        Life.fire s.life id Life.Destroy
+
+// ---- dockercompose runnable (Runnables/DockerCompose/*.cs) ----
+// ring runs `docker-compose up` ATTACHED and health-checks that client
+// process; Ok|Dead - a dead compose never recovers. Stop = compose stop,
+// Destroy = compose down.
+
+let tickCompose s id child =
+    if Instant.now () >= s.deadline then true
+    else
+        Life.fire s.life id Life.HealthLoop
+        if Proc.running child then
+            Life.fire s.life id Life.HcOk
+            false
+        else
+            Life.fire s.life id Life.HcDead
+            true
+
+let superviseCompose s c =
+    let id = c.id |> Option.defaultValue c.path
+    let fp =
+        c.workingDir
+            |> Option.map (fun d -> Path.combine d c.path)
+            |> Option.defaultValue c.path
+    // docker-compose is an OPTIONAL backend: a literal head would refuse to
+    // run ANY workspace on a machine without it, so these go through sh -c
+    let compose args = $"docker-compose -f {shq fp} {args}"
+    let rmLine = compose "rm -f"
+    let rmR = sh -c $rmLine | complete
+    if rmR.exitCode <> 0 then printerr $"[{id}] docker-compose rm failed (exit {show rmR.exitCode})"
+    let pullLine = compose "pull"
+    let pullR = sh -c $pullLine | complete
+    if pullR.exitCode <> 0 then printerr $"[{id}] docker-compose pull failed (exit {show pullR.exitCode})"
+    Life.fire s.life id Life.Init
+    let upLine = compose "up --force-recreate"
+    within
+        Life.fire s.life id Life.Start
+        within proc child = sh -c $upLine
+            within
+                Duration.sleep s.period
+                let budget = (s.deadline - Instant.now ()) + 60s
+                poll { Poll.defaults with timeout = budget; interval = s.period }
+                    tickCompose s id child
+            always
+                Life.fire s.life id Life.Stop
+                let stopLine = compose "stop"
+                let _stopR = sh -c $stopLine | complete
+                ()
+    always
+        let downLine = compose "down"
+        let _downR = sh -c $downLine | complete
+        Life.fire s.life id Life.Destroy
+
+// ---- stubs (the not-ported teach) ----
+
+let stubTeach r =
+    let id = Config.idOf r
+    let why =
+        match Config.typeIdOf r with
+        | "dotnet" -> "needs git clone + csproj build + the dotnet process runner"
+        | _ -> "needs kubectl apply + namespace/pod polling"
+    print $"           {Life.pad 12 id} [stub] '{Config.typeIdOf r}' is not ported in Stage 1 ({why}); runnable stays ZERO"
+
+// ---- run ----
+
+let workspaceStateOf states =
+    if states |> Seq.isEmpty then "IDLE"
+    else
+        let allUp =
+            states
+                |> Seq.map Life.protoStateOf
+                |> Seq.forall (fun ps -> ps == "HEALTH_CHECK" || ps == "HEALTHY")
+        if allUp then "HEALTHY" else "DEGRADED"
+
+let report s ids =
+    print ""
+    print "=== final states ==="
+    ids
+        |> Seq.iter (fun id ->
+            let st = Life.stateOf s.life id
+            print $"{Life.pad 16 id} {Life.protoStateOf st} (recoveries: {show (readRecs s id)})")
+    print "WORKSPACE_STOPPED"
+
+let doRun a deadline =
+    let loaded = Config.load a.workspace
+    let sd = a.stateDir |> Option.defaultWith (fun () -> Path.newTempDir ())
+    Dir.create sd
+    let lctx = Life.Ctx { stateDir = sd }
+    let ids = loaded.runnables |> Seq.map Config.idOf |> Seq.freeze
+    ids |> File.write (Path.combine sd "ids")
+    print $"ring (weir, stage 1) workspace={a.workspace} runnables={ids |> Seq.length}"
+    print $"state dir: {sd}"
+    print $"SERVER_RUNNING {a.workspace}"
+    let s = Sup {
+        life = lctx
+        period = a.healthPeriod
+        deadline = deadline
+        maxRecoveries = a.maxRecoveries
+        wsEnv = loaded.wsEnv
+    }
+    let rd = if loaded.rootDir == "" then "." else loaded.rootDir
+    within cd rd
+        within
+            loaded.runnables
+                |> Seq.piter (fun r ->
+                    match r with
+                    | Proc p -> superviseProc s p
+                    | DockerCompose c -> superviseCompose s c
+                    | Dotnet _ -> stubTeach r
+                    | Kustomize _ -> stubTeach r)
+        always
+            report s ids
+    print "SERVER_SHUTDOWN"
+
+// ---- list ----
+
+let doList a =
+    let loaded = Config.load a.workspace
+    print $"workspace: {a.workspace}"
+    loaded.runnables
+        |> Seq.iter (fun r ->
+            let detail =
+                match r with
+                | Proc p -> p.command
+                | DockerCompose c -> c.path
+                | Dotnet d -> d.csproj
+                | Kustomize k -> k.path
+            print $"{Life.pad 14 (Config.typeIdOf r)} {Life.pad 16 (Config.idOf r)} {detail}")
+
+// ---- status (reads a live supervisor's state dir) ----
+
+let doStatus a =
+    let lctx = Life.Ctx { stateDir = a.stateDir }
+    let idsFile = Path.combine a.stateDir "ids"
+    if not (File.exists idsFile) then fail $"no supervisor state at {a.stateDir}"
+    let ids = File.read idsFile |> Seq.freeze
+    let states = ids |> Seq.map (Life.stateOf lctx) |> Seq.freeze
+    ids
+        |> Seq.zip states
+        |> Seq.iter (fun (st, id) ->
+            print $"{Life.pad 16 id} {Life.protoStateOf st}")
+    print $"workspace: {workspaceStateOf states}"
+
+match Args.load Cmd with
+| Run a -> doRun a (Instant.now () + a.runFor)
+| List a -> doList a
+| Status a -> doStatus a
