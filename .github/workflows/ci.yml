@@ -1,0 +1,57 @@
+# The ports currency gate: install the pinned weir release, check every
+# .weir file, run each port's own harness. A red run is the migration
+# signal for the next weir release (the tree-sitter-weir TARGET pattern).
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install the pinned weir
+        run: |
+          TAG="$(cat TARGET_WEIR_RELEASE)"
+          echo "target: $TAG"
+          curl -sSf https://weir.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: version is at least the target
+        run: |
+          have="$(weir --version)"
+          echo "have: $have  want >= $(cat TARGET_WEIR_RELEASE)"
+          case "$have" in
+            "$(cat TARGET_WEIR_RELEASE)"*) : ;;
+            *) echo "::warning::installed weir $have, pinned target $(cat TARGET_WEIR_RELEASE)" ;;
+          esac
+
+      - name: check every .weir file
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if weir check "$f" >/dev/null 2>&1; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"; weir check "$f" 2>&1 | sed 's/^/     /'; fail=1
+            fi
+          done < <(find asdf acme ring -name '*.weir' | sort)
+          exit $fail
+
+      - name: asdf harness
+        working-directory: asdf
+        run: weir test/run.weir
+
+      - name: acme harness
+        working-directory: acme
+        run: |
+          [ -f test/gen_keys.sh ] && bash test/gen_keys.sh || true
+          weir run_tests.weir
+
+      - name: ring harness
+        working-directory: ring
+        run: bash test/run.sh
