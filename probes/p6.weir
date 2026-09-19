@@ -1,0 +1,56 @@
+// probe: yaml workspace shape + union case naming vs Proc module + Args union
+type ProcCfg = {
+    id: Option<string>
+    command: string
+    args: Option<seq<string>>
+    workingDir: Option<string>
+    env: Option<seq<string * string>>
+}
+
+type ComposeCfg = {
+    id: Option<string>
+    path: string
+    workingDir: Option<string>
+}
+
+type Workspace = {
+    imports: Option<seq<string>>
+    proc: Option<seq<ProcCfg>>
+    dockercompose: Option<seq<ComposeCfg>>
+}
+
+type Runnable =
+    | Proc of ProcCfg
+    | DockerCompose of ComposeCfg
+
+let doc = <<<
+    proc:
+      - id: proc-2
+        command: sleep
+        args:
+          - "30"
+        env:
+          MY_TEST_ENV_VAR: NONSENSE
+          YET_ANOTHER: QUIT
+      - command: sleep
+        args:
+          - "40"
+    dockercompose:
+      - path: ./dc/docker-compose.yml
+
+let ws = doc |> from yaml Workspace
+let procs = ws.proc |> Option.defaultValue []
+print $"procs: {procs |> Seq.length}"
+let p0 = procs |> Seq.head
+print $"{p0.id} {p0.command} env={p0.env}"
+
+let all =
+    Seq.append
+        (procs |> Seq.map Proc)
+        (ws.dockercompose |> Option.defaultValue [] |> Seq.map DockerCompose)
+
+all
+    |> Seq.iter (fun r ->
+        match r with
+        | Proc p -> print $"proc {p.command}"
+        | DockerCompose c -> print $"compose {c.path}")

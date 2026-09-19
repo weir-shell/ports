@@ -1,0 +1,14 @@
+// probe: within proc with env sigil in command position, Proc.wait code, Proc.tail
+let ev = Env.ofPairs [("RING_PROBE", "42")]
+
+within proc child = $ev(sh -c "echo env is $RING_PROBE; sleep 0.3; exit 7")
+    poll timeout=5s interval=50ms
+        not (Proc.running child)
+    let code = Proc.wait child
+    let tail = Proc.tail child
+    print $"exit={code} tail={tail |> Str.join "/"}"
+
+// probe: within env around a scope
+within env ev
+    let out = sh -c "echo via-env-$RING_PROBE" |> Seq.exactlyOne
+    print out

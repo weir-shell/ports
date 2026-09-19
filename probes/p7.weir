@@ -1,0 +1,31 @@
+// probe: Args.load subcommand union, Duration/int defaults
+type RunArgs = {
+    /// workspace file (yaml)
+    [<Short "w">]
+    workspace: string
+    /// supervision budget
+    [<Default 12h>]
+    runFor: Duration
+    /// health check period
+    [<Default 5s>]
+    healthPeriod: Duration
+    /// state/event dir (created if absent)
+    stateDir: Option<string>
+    /// max recoveries per runnable before giving up
+    [<Default 1000000>]
+    maxRecoveries: int
+}
+
+type ListArgs = {
+    [<Short "w">]
+    workspace: string
+}
+
+type Cmd =
+    | Run of RunArgs
+    | List of ListArgs
+
+let cmd = Args.load Cmd
+match cmd with
+| Run a -> print $"run {a.workspace} for={a.runFor} period={a.healthPeriod} max={show a.maxRecoveries} sd={a.stateDir}"
+| List a -> print $"list {a.workspace}"

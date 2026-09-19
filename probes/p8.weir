@@ -1,0 +1,13 @@
+let d = Path.newTempDir ()
+let f = Path.combine d "s"
+["one"] |> File.write f
+["two"] |> File.write f
+print (File.read f |> Seq.exactlyOne)
+
+let budget = 300ms + 200ms
+poll { Poll.defaults with timeout = budget; interval = 50ms }
+    Instant.now () >= (Instant.now () - 1s)
+print "poll-record ok"
+
+["a"; "b"] |> Seq.piter (fun x -> print $"worker {x}")
+Dir.deleteAll d
