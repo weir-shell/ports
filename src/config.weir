@@ -1,0 +1,189 @@
+module Config
+
+// ring's workspace config model (src/Queil.Ring.Configuration), yaml spelling.
+// TOML [[proc]] tables become `proc:` sequences; [proc.env] becomes a nested
+// `env:` mapping; workspace [env.<typeId>] becomes the `env:` section keyed by
+// type id (a closed set, so a declared record instead of C#'s Dictionary).
+
+/// [[proc]] (Configuration/Runnables/Proc.cs)
+type ProcCfg = {
+    id: Option<string>
+    command: string
+    args: Option<seq<string>>
+    workingDir: Option<string>
+    env: Option<seq<string * string>>
+    tags: Option<seq<string>>
+}
+
+/// [[dockercompose]] (Configuration/Runnables/DockerCompose.cs)
+type ComposeCfg = {
+    id: Option<string>
+    path: string
+    workingDir: Option<string>
+    env: Option<seq<string * string>>
+    tags: Option<seq<string>>
+}
+
+/// [[dotnet]] (CsProjRunnable) - declared, NOT supervised in Stage 1
+type DotnetCfg = {
+    id: Option<string>
+    csproj: string
+    workingDir: Option<string>
+    args: Option<seq<string>>
+    urls: Option<seq<string>>
+    configuration: Option<string>
+    sshRepoUrl: Option<string>
+    env: Option<seq<string * string>>
+    tags: Option<seq<string>>
+}
+
+/// [[kustomize]] - declared, NOT supervised in Stage 1
+type KustomizeCfg = {
+    id: Option<string>
+    path: string
+    workingDir: Option<string>
+    env: Option<seq<string * string>>
+    tags: Option<seq<string>>
+}
+
+/// workspace-level [env.<typeId>]: the type-id set is closed, so it is a
+/// record where ring has Dictionary<string, Dictionary<string, string>>
+type EnvByType = {
+    proc: Option<seq<string * string>>
+    dockercompose: Option<seq<string * string>>
+    dotnet: Option<seq<string * string>>
+    kustomize: Option<seq<string * string>>
+}
+
+/// one workspace file (WorkspaceConfig.cs; tasks are Stage-2)
+type Workspace = {
+    imports: Option<seq<string>>
+    env: Option<EnvByType>
+    proc: Option<seq<ProcCfg>>
+    dockercompose: Option<seq<ComposeCfg>>
+    dotnet: Option<seq<DotnetCfg>>
+    kustomize: Option<seq<KustomizeCfg>>
+}
+
+/// ring's runnable class hierarchy as a union
+type Runnable =
+    | Proc of ProcCfg
+    | DockerCompose of ComposeCfg
+    | Dotnet of DotnetCfg
+    | Kustomize of KustomizeCfg
+
+/// a fully loaded workspace: the import tree flattened
+type Loaded = {
+    rootDir: string
+    runnables: seq<Runnable>
+    wsEnv: EnvByType
+}
+
+let parseFile p =
+    File.read p |> from yaml Workspace
+
+let orEmpty o = o |> Option.defaultValue []
+
+let importsOf p =
+    let ws = parseFile p
+    ws.imports
+        |> orEmpty
+        |> Seq.map (fun i -> Path.normalize (Path.combine (Path.dir p) i))
+        |> Seq.freeze
+
+let runnablesOf ws =
+    [
+        ws.proc |> orEmpty |> Seq.map Proc
+        ws.dockercompose |> orEmpty |> Seq.map DockerCompose
+        ws.dotnet |> orEmpty |> Seq.map Dotnet
+        ws.kustomize |> orEmpty |> Seq.map Kustomize
+    ]
+        |> Seq.concat
+
+let emptyEnv = {
+    proc = None
+    dockercompose = None
+    dotnet = None
+    kustomize = None
+}
+
+let mergeEnvSection : Option<seq<string * string>> -> Option<seq<string * string>> -> Option<seq<string * string>>
+
+let mergeEnvSection a b =
+    match b with
+    | None -> a
+    | Some bs -> Some (Seq.append (a |> orEmpty) bs |> Seq.freeze)
+
+let mergeEnv : EnvByType -> Workspace -> EnvByType
+
+let mergeEnv acc w =
+    match w.env with
+    | None -> acc
+    | Some e ->
+        {
+            proc = mergeEnvSection acc.proc e.proc
+            dockercompose = mergeEnvSection acc.dockercompose e.dockercompose
+            dotnet = mergeEnvSection acc.dotnet e.dotnet
+            kustomize = mergeEnvSection acc.kustomize e.kustomize
+        }
+
+/// load a workspace file and its whole import tree (ring's ConfigSet loader;
+/// Graph.reach makes the tree walk cycle- and diamond-safe for free)
+let load : string -> Loaded
+
+let load path =
+    let root = Path.normalize path
+    let files = Graph.reach (fun p -> p) importsOf root |> Seq.freeze
+    let parsed = files |> Seq.map parseFile |> Seq.freeze
+    {
+        rootDir = Path.dir root
+        runnables = parsed |> Seq.collect runnablesOf |> Seq.freeze
+        wsEnv = parsed |> Seq.fold mergeEnv emptyEnv
+    }
+
+/// ring's UniqueId: Id ?? Command (proc) / Id ?? Path (compose, kustomize) /
+/// Id ?? csproj stem (dotnet)
+let idOf : Runnable -> string
+
+let idOf r =
+    match r with
+    | Proc p -> p.id |> Option.defaultValue p.command
+    | DockerCompose c -> c.id |> Option.defaultValue c.path
+    | Dotnet d -> d.id |> Option.defaultValue (Path.stem d.csproj)
+    | Kustomize k -> k.id |> Option.defaultValue k.path
+
+let typeIdOf : Runnable -> string
+
+let typeIdOf r =
+    match r with
+    | Proc _ -> "proc"
+    | DockerCompose _ -> "dockercompose"
+    | Dotnet _ -> "dotnet"
+    | Kustomize _ -> "kustomize"
+
+let sectionFor : EnvByType -> Runnable -> Option<seq<string * string>>
+
+let sectionFor wsEnv r =
+    match r with
+    | Proc _ -> wsEnv.proc
+    | DockerCompose _ -> wsEnv.dockercompose
+    | Dotnet _ -> wsEnv.dotnet
+    | Kustomize _ -> wsEnv.kustomize
+
+let ownEnv : Runnable -> Option<seq<string * string>>
+
+let ownEnv r =
+    match r with
+    | Proc p -> p.env
+    | DockerCompose c -> c.env
+    | Dotnet d -> d.env
+    | Kustomize k -> k.env
+
+/// effective child env: workspace [env.<typeId>] overlaid by the runnable's
+/// own env (runnable wins), ring's merge order
+let envFor : EnvByType -> Runnable -> seq<string * string>
+
+let envFor wsEnv r =
+    Seq.append (sectionFor wsEnv r |> orEmpty) (ownEnv r |> orEmpty)
+        |> Map.ofPairs
+        |> Map.pairs

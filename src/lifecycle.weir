@@ -1,0 +1,189 @@
+module Lifecycle
+
+// ring's runnable state machine, ported from
+// src/Queil.Ring.DotNet.Cli/Abstractions/Runnable.cs (Stateless FSM config).
+// States/triggers keep ring's names; transitions are the exact Permit/Ignore set.
+
+/// ring's internal State enum (Runnable.cs)
+type RState =
+    | Zero
+    | Idle
+    | Pending
+    | ProbingHealth
+    | Healthy
+    | Recovering
+    | Dead
+
+/// ring's Trigger enum (Invalid omitted: refusal is data here, see Next)
+type Trigger =
+    | Init
+    | InitFailure
+    | Start
+    | Stop
+    | Destroy
+    | HealthLoop
+    | HcOk
+    | HcUnhealthy
+    | HcDead
+    | NoOp
+
+/// Goto = Permit, Stay = Ignore, Refused = Stateless' unhandled-trigger throw
+type Next =
+    | Goto of RState
+    | Stay
+    | Refused
+
+/// ring's HealthStatus (Dead renamed Fatal: 'Dead' is taken by RState)
+type HealthStatus =
+    | Ok
+    | Unhealthy
+    | Fatal
+    | Ignore
+
+/// supervisor context shared by all runnables
+type Ctx = {
+    stateDir: string
+}
+
+let transition : RState -> Trigger -> Next
+
+let transition s t =
+    match (s, t) with
+    | (Zero, Init) -> Goto Idle
+    | (Zero, NoOp) -> Stay
+    | (Zero, HcOk) -> Stay
+    | (Zero, HcUnhealthy) -> Stay
+    | (Zero, Stop) -> Stay
+    | (Zero, Destroy) -> Stay
+    | (Idle, Start) -> Goto Pending
+    | (Idle, InitFailure) -> Goto Pending
+    | (Idle, Destroy) -> Goto Zero
+    | (Idle, HcUnhealthy) -> Stay
+    | (Idle, NoOp) -> Stay
+    | (Idle, HcOk) -> Stay
+    | (Idle, Stop) -> Stay
+    | (Pending, HealthLoop) -> Goto ProbingHealth
+    | (Pending, Stop) -> Goto Idle
+    | (ProbingHealth, HcOk) -> Goto Healthy
+    | (ProbingHealth, HcDead) -> Goto Dead
+    | (ProbingHealth, HcUnhealthy) -> Goto Recovering
+    | (ProbingHealth, Stop) -> Goto Idle
+    | (ProbingHealth, NoOp) -> Stay
+    | (Healthy, HealthLoop) -> Goto ProbingHealth
+    | (Healthy, Stop) -> Goto Idle
+    | (Dead, Stop) -> Goto Idle
+    | (Recovering, Stop) -> Goto Idle
+    | _ -> Refused
+
+/// protocol event pushed on a trigger (Queil.Ring.Protocol M enum names)
+let eventOf : Trigger -> Option<string>
+
+let eventOf t =
+    match t with
+    | Init -> Some "RUNNABLE_INITIATED"
+    | Start -> Some "RUNNABLE_STARTED"
+    | HealthLoop -> Some "RUNNABLE_HEALTH_CHECK"
+    | HcOk -> Some "RUNNABLE_HEALTHY"
+    | HcUnhealthy -> Some "RUNNABLE_RECOVERING"
+    | HcDead -> Some "RUNNABLE_UNRECOVERABLE"
+    | Stop -> Some "RUNNABLE_STOPPED"
+    | Destroy -> Some "RUNNABLE_DESTROYED"
+    | InitFailure -> None
+    | NoOp -> None
+
+let parseState : string -> RState
+
+let parseState s =
+    match s with
+    | "Zero" -> Zero
+    | "Idle" -> Idle
+    | "Pending" -> Pending
+    | "ProbingHealth" -> ProbingHealth
+    | "Healthy" -> Healthy
+    | "Recovering" -> Recovering
+    | "Dead" -> Dead
+    | other -> fail $"corrupt state file: '{other}'"
+
+/// internal state -> protocol RunnableState (WorkspaceLauncher.cs:228-237)
+let protoStateOf : RState -> string
+
+let protoStateOf s =
+    match s with
+    | Zero -> "ZERO"
+    | Idle -> "INITIATED"
+    | Pending -> "STARTED"
+    | ProbingHealth -> "HEALTH_CHECK"
+    | Healthy -> "HEALTHY"
+    | Recovering -> "RECOVERING"
+    | Dead -> "DEAD"
+
+/// filesystem-safe spelling of a runnable id (compose ids are paths)
+let safeId : string -> string
+
+let safeId id =
+    id |> Str.replace "/" "_" |> Str.replace "\\" "_" |> Str.replace ":" "_"
+
+let stateFile : Ctx -> string -> string
+
+let stateFile ctx id = Path.combine ctx.stateDir $"state-{safeId id}"
+
+let eventsFile : Ctx -> string
+
+let eventsFile ctx = Path.combine ctx.stateDir "events.log"
+
+/// current lifecycle state of a runnable (Zero when never seen)
+let stateOf : Ctx -> string -> RState
+
+let stateOf ctx id =
+    let f = stateFile ctx id
+    if File.exists f then parseState (File.read f |> Seq.exactlyOne) else Zero
+
+/// left-pad-free column helper (weir has no Str.padRight)
+let pad : int -> string -> string
+
+let pad w s =
+    let n = w - Str.length s
+    if n <= 0 then s else s + (Seq.replicate n " " |> Str.join "")
+
+let clock () =
+    show (Instant.now ()) |> Str.splitOnce "T" |> snd
+
+let logEvent ctx id ev fromS toS =
+    within lock (Path.combine ctx.stateDir "log.lock") timeout=30s
+        File.append (eventsFile ctx) [$"{show (Instant.now ())} {id} {ev} {show fromS}->{show toS}"]
+
+let fromWasHealthy prev =
+    match prev with
+    | "Healthy" -> true
+    | _ -> false
+
+// console policy: every event goes to events.log; the console gets state
+// CHANGES only (ring pushes RUNNABLE_HEALTH_CHECK/HEALTHY on every probe -
+// that is a status stream for clients, noise on a terminal)
+let shouldPrint ev prev =
+    match ev with
+    | "RUNNABLE_HEALTH_CHECK" -> false
+    | "RUNNABLE_HEALTHY" -> not (fromWasHealthy prev)
+    | _ -> true
+
+/// drive one trigger through the state machine: persist the new state,
+/// append the protocol event, print state changes. Refused transitions fail
+/// loudly (Stateless throws there too).
+let fire : Ctx -> string -> Trigger -> unit
+
+let fire ctx id trig =
+    let cur = stateOf ctx id
+    match transition cur trig with
+    | Refused -> fail $"invalid transition: {trig} in {cur} for '{id}'"
+    | Stay -> ()
+    | Goto next ->
+        let prevFile = Path.combine ctx.stateDir $"prev-{safeId id}"
+        let prev = if File.exists prevFile then File.read prevFile |> Seq.exactlyOne else "Zero"
+        [show cur] |> File.write prevFile
+        [show next] |> File.write (stateFile ctx id)
+        match eventOf trig with
+        | None -> ()
+        | Some ev ->
+            logEvent ctx id ev cur next
+            if shouldPrint ev prev then
+                print $"{clock ()} {pad 12 id} {pad 24 ev} {show cur} -> {show next}"

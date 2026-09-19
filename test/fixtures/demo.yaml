@@ -1,0 +1,12 @@
+proc:
+  - id: steady
+    command: bash
+    args:
+      - stubs/ring-stub-steady.sh
+    env:
+      STEADY_VAR: from-config
+  - id: flaky
+    command: bash
+    args:
+      - stubs/ring-stub-flaky.sh
+      - "1"

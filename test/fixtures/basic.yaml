@@ -1,0 +1,14 @@
+proc:
+  - id: proc-2
+    command: sleep
+    args:
+      - "30"
+    env:
+      MY_TEST_ENV_VAR: NONSENSE
+      YET_ANOTHER: QUIT
+  - id: proc-1
+    command: sleep
+    args:
+      - "40"
+    env:
+      WEIRD_VAR: "42"

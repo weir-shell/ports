@@ -1,0 +1,3 @@
+dockercompose:
+  - id: dc-main
+    path: dc/docker-compose.yml
