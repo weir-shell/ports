@@ -1,0 +1,53 @@
+#!/usr/bin/env weir
+// asdf list [plugin] [query] — ports command-list.bash.
+// With no plugin: every plugin then its installed versions. With a
+// plugin: its installed versions, filtered by an optional query prefix.
+// A "*" marks the current (preset) version.
+
+import "../core.weir" as Core
+
+let args = Self.args |> Seq.force
+let plugin = args |> Seq.tryItem 0 |> Option.defaultValue ""
+let query = args |> Seq.tryItem 1 |> Option.defaultValue ""
+
+// display_installed_versions: print each installed version with a flag,
+// "*" when it equals the current preset version. Ports the function.
+let displayInstalled name =
+    let all = Core.installedVersions name |> Seq.force
+    // query filter: grep -E "^\s*<query>" (a leading-anchored prefix)
+    let versions =
+        if query == "" then all
+        else all |> Seq.where (fun v -> v |> Str.startsWith query)
+    if query <> "" && (versions |> Seq.isEmpty) then
+        printerr $"No compatible versions installed ({name} {query})"
+        exit 1
+    if versions |> Seq.isEmpty then
+        printerr "  No versions installed"
+    else
+        // bash's current_version is `cut -f1` of find_versions — the WHOLE
+        // space-joined version string, NOT the first version. So a plugin
+        // with two set versions ("1.0.0 2.0.0") matches no single install
+        // and stars nothing; only a single-version preset ever stars. We
+        // reproduce that quirk faithfully [FINDING: a bash accident].
+        let current =
+            Core.findVersions name (pwd |> Seq.exactlyOne) |> _.versions |> Str.join " "
+        for v in versions do
+            let flag = if v == current then " *" else "  "
+            print $"{flag}{v}"
+
+if plugin <> "" then
+    if not (Core.pluginExists plugin) then
+        printerr $"No such plugin: {plugin}"
+        exit 1
+    displayInstalled plugin
+    exit 0
+
+// no plugin given: list all plugins with their installed versions
+let plugins = Core.pluginList () |> Seq.force
+if plugins |> Seq.isEmpty then
+    print "No plugins installed"
+    exit 0
+
+for p in plugins do
+    print p
+    displayInstalled p

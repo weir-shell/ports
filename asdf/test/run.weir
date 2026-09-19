@@ -1,0 +1,145 @@
+#!/usr/bin/env weir
+// Stage 1 test runner. Runs each ported command against the fixture tree
+// and asserts stdout + exit code. Where the bash asdf oracle is available
+// (ASDF_ORACLE + a bash), it ALSO runs the real asdf for the same case
+// and cross-checks stdout — so the assertions are pinned to ground truth,
+// not just to what we read. Run: weir test/run.weir
+//
+// The fixture tree lives beside this file; the runner cd's into the deep
+// nested dir to exercise the upward .tool-versions walk, and points
+// ASDF_DATA_DIR at the fixture data dir.
+
+// seq<string> has no ==; compare by joining on a newline [FINDING].
+let seqEq a b = (a |> Str.join "\n") == (b |> Str.join "\n")
+
+let here = Path.dir Self.scriptPath
+let fixtures = Path.combine here "fixtures"
+let dataDir = Path.combine fixtures "asdf-data"
+let deepDir = Path.combine fixtures "project/nested/deep"
+let cmdDir = Path.combine here "../lib/commands"
+let noHome = Path.combine fixtures "nohome"
+
+// the child env: fixture data dir, a HOME with no .tool-versions, and the
+// oracle's ASDF_DIR (the bash source) so the oracle can run too
+let baseEnv = Env.ofPairs [
+    ("ASDF_DATA_DIR", dataDir)
+    ("HOME", noHome)
+    ("ASDF_DIR", "/tmp/asdf-src")
+]
+
+// does the bash oracle exist and run here?
+let oracle = "/tmp/asdf-src/bin/asdf"
+let haveOracle = File.exists oracle
+
+type Case = {
+    /// human label
+    name: string
+    /// the ported command script (basename under lib/commands)
+    cmd: string
+    /// argv for the command
+    argv: seq<string>
+    /// expected stdout lines
+    stdout: seq<string>
+    /// expected exit code
+    code: int
+    /// the oracle subcommand+args to cross-check (empty = skip oracle)
+    oracle: seq<string>
+}
+
+// run a ported command from deepDir under the fixture env, capturing all
+let runPorted cmd argv =
+    let script = Path.combine cmdDir $"{cmd}.weir"
+    within cd deepDir
+        within env baseEnv
+            let r = weir $script $@argv | complete
+            r
+
+// run the bash oracle from deepDir; stdout only (the migration notice
+// and asdf's own errors go to stderr)
+let runOracle argv =
+    let joined = argv |> Seq.map (fun a -> $"'{a}'") |> Str.join " "
+    within cd deepDir
+        within env baseEnv
+            let r = sh -c $"bash '{oracle}' {joined}" | complete
+            r
+
+let cases = [
+    { name = "where dummy (walks up, first version)"
+      cmd = "where"; argv = ["dummy"]
+      stdout = [$"{dataDir}/installs/dummy/1.0.0"]; code = 0
+      oracle = ["where"; "dummy"] }
+    { name = "where dummy 1.0.0 (explicit)"
+      cmd = "where"; argv = ["dummy"; "1.0.0"]
+      stdout = [$"{dataDir}/installs/dummy/1.0.0"]; code = 0
+      oracle = ["where"; "dummy"; "1.0.0"] }
+    { name = "where dummy 9.9.9 (not installed)"
+      cmd = "where"; argv = ["dummy"; "9.9.9"]
+      stdout = ["Version not installed"]; code = 1
+      oracle = ["where"; "dummy"; "9.9.9"] }
+    { name = "where nope (no plugin, stderr)"
+      cmd = "where"; argv = ["nope"]
+      stdout = []; code = 1
+      oracle = [] }
+    { name = "list dummy (multi-preset: no star)"
+      cmd = "list"; argv = ["dummy"]
+      stdout = ["  1.0.0"; "  2.0.0"; "  ref:main"]; code = 0
+      oracle = ["list"; "dummy"] }
+    { name = "list dummy 2 (query prefix)"
+      cmd = "list"; argv = ["dummy"; "2"]
+      stdout = ["  2.0.0"]; code = 0
+      oracle = ["list"; "dummy"; "2"] }
+    { name = "list (all plugins)"
+      cmd = "list"; argv = []
+      stdout = ["dummy"; "  1.0.0"; "  2.0.0"; "  ref:main"; "empty-plug"]; code = 0
+      oracle = [] }
+    { name = "current dummy (row + source path)"
+      cmd = "current"; argv = ["dummy"]
+      stdout = [$"dummy           1.0.0 2.0.0     {fixtures}/project/.tool-versions"]; code = 0
+      oracle = ["current"; "dummy"] }
+    { name = "which dummytool (shim -> install bin)"
+      cmd = "which"; argv = ["dummytool"]
+      stdout = [$"{dataDir}/installs/dummy/1.0.0/bin/dummytool"]; code = 0
+      oracle = ["which"; "dummytool"] }
+    { name = "which nope (unknown shim, stderr)"
+      cmd = "which"; argv = ["nope"]
+      stdout = []; code = 1
+      oracle = [] }
+    { name = "which subtool (list-bin-paths callback -> sub/bin)"
+      cmd = "which"; argv = ["subtool"]
+      stdout = [$"{dataDir}/installs/dummy/1.0.0/sub/bin/subtool"]; code = 0
+      oracle = ["which"; "subtool"] }
+]
+
+// run every case; collect pass/fail
+let results =
+    cases
+    |> Seq.map (fun c ->
+        let r = runPorted c.cmd c.argv
+        let gotOut = r.stdout |> Seq.force
+        let wantOut = c.stdout |> Seq.force
+        let outOk = seqEq gotOut wantOut
+        let codeOk = r.exitCode == c.code
+        // oracle cross-check (stdout only), when requested and available
+        let oracleOk =
+            if (c.oracle |> Seq.isEmpty) || not haveOracle then true
+            else
+                let o = runOracle c.oracle
+                seqEq (o.stdout |> Seq.force) wantOut
+        let pass = outOk && codeOk && oracleOk
+        if not pass then
+            printerr $"FAIL: {c.name}"
+            if not outOk then
+                printerr $"  stdout want: {wantOut}"
+                printerr $"  stdout got:  {gotOut}"
+            if not codeOk then printerr $"  exit want {c.code}, got {r.exitCode}"
+            if not oracleOk then printerr "  oracle stdout diverged from expected"
+        else
+            print $"ok: {c.name}"
+        pass)
+    |> Seq.force
+
+let passed = results |> Seq.where (fun b -> b) |> Seq.length
+let total = results |> Seq.length
+print $"---"
+print $"{passed}/{total} passed (oracle {(if haveOracle then "on" else "off")})"
+if passed < total then exit 1

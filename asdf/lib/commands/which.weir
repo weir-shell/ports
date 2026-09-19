@@ -1,0 +1,32 @@
+#!/usr/bin/env weir
+// asdf which <command> — ports command-which.bash.
+// Resolves a shim name to the actual executable path via the current
+// version, printing it. Errors to stderr, exit 1 on any failure.
+
+import "../core.weir" as Core
+
+let args = Self.args |> Seq.force
+// basename of arg 1 (which_command does `basename "$1"`)
+let shimName = args |> Seq.tryItem 0 |> Option.map Path.fileName |> Option.defaultValue ""
+
+if shimName == "" then
+    print "usage: asdf which <command>"
+    exit 1
+
+// with_shim_executable: no shim file -> "unknown command" on stderr, 1
+let shimPath = $"{Core.dataDir ()}/shims/{shimName}"
+if not (File.exists shimPath) then
+    printerr $"unknown command: {shimName}. Perhaps you have to reshim?"
+    exit 1
+
+match Core.whichExecutable shimName with
+| Some p ->
+    // print_exec: the executable must be present and executable
+    print p
+    exit 0
+| None ->
+    // no selected/executable version: bash's with_shim_executable falls
+    // to the "No preset/version set" >&2 block, exit 126; print_exec's
+    // own "No X executable found" covers the found-but-not-x case.
+    printerr $"No version is set for command {shimName}"
+    exit 126

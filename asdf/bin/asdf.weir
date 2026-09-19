@@ -1,0 +1,37 @@
+#!/usr/bin/env weir
+// asdf — the dispatcher slice (ports bin/asdf's routing). Routes the
+// four read-only commands ported in Stage 1; everything else is a
+// "not yet ported" stub. The bash dispatcher set ASDF_* env vars then
+// sourced/exec'd command files; here we run the command's weir script
+// as a child, forwarding argv — the plugins-as-programs discipline
+// applied to our own commands too.
+
+let args = Self.args |> Seq.force
+let sub = args |> Seq.tryItem 0 |> Option.defaultValue ""
+let rest = args |> Seq.skip 1 |> Seq.force
+
+// command scripts live beside this file, under ../lib/commands
+let cmdDir = Path.combine (Path.dir Self.scriptPath) "../lib/commands"
+
+// dispatch: run the matching command script as a child weir, forwarding
+// the remaining argv (a splat). The child's exit code propagates because
+// a nonzero exit raises, which we surface as our own failure.
+let runCmd name =
+    let script = Path.combine cmdDir $"{name}.weir"
+    let r = weir $script $@rest | complete
+    r.stdout |> Seq.iter print
+    r.stderr |> Seq.iter printerr
+    r.exitCode
+
+match sub with
+| "where" -> exit (runCmd "where")
+| "current" -> exit (runCmd "current")
+| "list" -> exit (runCmd "list")
+| "which" -> exit (runCmd "which")
+| "" ->
+    printerr "usage: asdf <command>"
+    exit 1
+| other ->
+    // the not-yet-ported stubs — every other asdf subcommand
+    printerr $"Not yet ported (Stage 1 is read-only: where, current, list, which): {other}"
+    exit 127

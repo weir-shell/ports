@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "dummytool 1.0.0"
