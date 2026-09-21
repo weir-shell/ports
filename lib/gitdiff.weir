@@ -1,0 +1,112 @@
+module GitDiff
+
+// Change detection, ported from fsx/git-diff.fsx + the ParseCommitMessage
+// member of fsx/tools/git.fsx. Uses the `git` literal command head
+// throughout (weir resolves it at check time).
+
+import "./types.weir" as T
+
+/// Relative dir of a repo-root-relative file path ("" -> ".", matching
+/// .NET's Path.GetRelativePath of a top-level file's dir to cwd).
+let dirOf : string -> string
+
+let dirOf path =
+    let d = path |> Path.dir
+    if d == "" then "." else d
+
+/// Group (dir, file) pairs into dbt's Map<dir, files>, honouring the
+/// includeRootDir filter (git-diff.fsx drops dir="." unless included).
+/// Distinct files per dir, matching Seq.distinct in dirsFromDiff.
+let groupDirs : bool -> seq<string> -> Map<string, seq<string>>
+
+let groupDirs includeRoot files =
+    files
+    |> Seq.where (fun f -> f <> "")
+    |> Seq.where (fun f -> includeRoot || dirOf f <> ".")
+    |> Seq.groupBy dirOf
+    |> Seq.map (fun (d, fs) -> (d, fs |> Seq.distinct |> Seq.freeze))
+    |> Map.ofPairs
+
+/// All tracked files' dirs (git-diff.fsx allDirs -> git ls-files).
+let allDirs : bool -> Map<string, seq<string>>
+
+let allDirs includeRoot =
+    let files = git ls-files
+    groupDirs includeRoot files
+
+/// Resolve the base commit list for a strategy (git-diff.fsx baseRefs).
+/// Parent -> the current commit's parents (%P); Override -> rev-parse
+/// the ref; MergeBase -> fetch the branch and merge-base it.
+let resolveBaseRefs : string -> BaseStrategy -> seq<string>
+
+let resolveBaseRefs currentCommit strategy =
+    match strategy with
+    | Parent ->
+        let parents = git show --no-patch $"--format=%P" $currentCommit |> Seq.exactlyOne
+        parents |> Str.fields |> Seq.freeze
+    | Override "0000000000000000000000000000000000000000" ->
+        let parents = git show --no-patch $"--format=%P" $currentCommit |> Seq.exactlyOne
+        parents |> Str.fields |> Seq.freeze
+    | Override r ->
+        let resolved = git rev-parse $r |> Seq.exactlyOne |> Str.trim
+        [resolved]
+    | MergeBase branch ->
+        let _f = git fetch origin $"{branch}:refs/remotes/origin/{branch}" | complete
+        let mb = git merge-base $"origin/{branch}" $currentCommit |> Seq.exactlyOne |> Str.trim
+        [mb]
+
+/// Changed files between a base ref and the current commit
+/// (git-diff.fsx FileStatus.getChangedFiles, i.e. diff --name-only).
+let changedFiles : string -> string -> seq<string>
+
+let changedFiles baseRef currentCommit =
+    git --no-pager diff --name-only $baseRef $currentCommit |> Seq.freeze
+
+/// Keep only dirs that still exist on disk (git-diff.fsx's final filter:
+/// a deleted dir is dropped with a warning).
+let existingDirs : Map<string, seq<string>> -> Map<string, seq<string>>
+
+let existingDirs dirs =
+    dirs
+    |> Map.pairs
+    |> Seq.where (fun (d, _) ->
+        if d == "." then true
+        elif Dir.exists d then true
+        else
+            printerr $"WARNING: path '{d}' no longer exists in the repository. Ignoring."
+            false)
+    |> Map.ofPairs
+
+/// The diff pipeline (git-diff.fsx dirsFromDiff): resolve base refs,
+/// collect changed files across all of them, group, filter to existing.
+let dirsFromDiff : bool -> BaseStrategy -> Option<string> -> DiffResult
+
+let dirsFromDiff includeRoot strategy toRef =
+    let currentCommit =
+        match toRef with
+        | Some r -> r
+        | None -> git rev-parse HEAD |> Seq.exactlyOne |> Str.trim
+    let baseRefs = resolveBaseRefs currentCommit strategy
+    let allChanged =
+        baseRefs
+        |> Seq.collect (fun b -> changedFiles b currentCommit)
+        |> Seq.freeze
+    let dirs = groupDirs includeRoot allChanged |> existingDirs
+    T.DiffResult {
+        effectiveRange = T.ChangeSetRange { baseCommits = baseRefs; currentCommit = currentCommit }
+        dirs = dirs
+    }
+
+/// Scrape change keys from commit messages in base..current
+/// (git.fsx ParseCommitMessage): `git log --pretty=%B base..current`,
+/// take the FIRST match of the single-group regex per line, distinct.
+/// Empirically dbt yields the first match per line only (ParseRegex).
+let parseCommitKeys : string -> string -> string -> seq<string>
+
+let parseCommitKeys regex baseCommit currentCommit =
+    git --no-pager log $"--pretty=%B" $"{baseCommit}..{currentCommit}"
+    |> Seq.choose (fun line ->
+        match Str.rmatch regex line with
+        | Some groups -> groups |> Seq.tryHead
+        | None -> None)
+    |> Seq.distinct
