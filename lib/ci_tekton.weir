@@ -1,0 +1,212 @@
+module CiTekton
+
+// Tekton CI integrations, ported from fsx/ci/tekton/{last-success-sha,
+// deploy-spec,output}.fsx.
+//
+// Same three surfaces as github, with Tekton's shapes:
+//  1. last-success-sha — queries the Tekton Results API (a host + an SA
+//     bearer token from a mounted file) and picks the most-recent
+//     successful result, reading its `commit` annotation. The API and the
+//     mounted token are unreachable here; the port drives the PURE `logic`
+//     over in-memory Results (oracle'd structurally) and SHAPES the Http
+//     call (typed request, insecure toggle, from json), `weir check`-proven.
+//  2. deploy-spec — pure PlanOutput -> UpdateSpec from typed env.
+//  3. output — write a value to a Tekton result file ($RESULT_<name> or
+//     ./<name>.txt).
+
+import "./types.weir" as T
+import "./cispec.weir" as Spec
+
+// ---- Results API shapes (last-success-sha.fsx) ----
+
+/// A result's summary (Summary). end_time is Option (may be missing);
+/// annotations carry the commit. update_time on the parent is the
+/// fallback sort key. Times are ISO instants (dbt: DateTimeOffset).
+type Summary = {
+    [<Wire "type">]
+    kind: string
+    status: Option<string>
+    end_time: Option<string>
+    annotations: Map<string, string>
+}
+
+/// A pipeline result (Result). `summary.annotations["commit"]` is the SHA.
+type TektonResult = {
+    name: string
+    update_time: string
+    annotations: Map<string, string>
+    summary: Summary
+}
+
+/// The results-list response (ResultsResponse).
+type ResultsResponse = {
+    results: Option<seq<TektonResult>>
+    nextPageToken: Option<string>
+}
+
+/// The discovery outcome (RunDiscovery), same shape as github's.
+type RunDiscovery =
+    | HeadSha of string
+    | NoneSuccessful
+    | NoneFound
+    | Skipped
+
+let toOption : RunDiscovery -> Option<string>
+
+let toOption d =
+    match d with
+    | HeadSha commit -> Some commit
+    | NoneSuccessful -> None
+    | NoneFound -> None
+    | Skipped -> None
+
+/// A result's commit annotation (last-success-sha.fsx commitOf).
+let commitOf : TektonResult -> Option<string>
+
+let commitOf r =
+    Map.tryGet "commit" r.summary.annotations
+
+/// A result's sort key: its summary end_time, or the parent update_time
+/// (last-success-sha.fsx endKey). Parsed to an Instant for ordering.
+let endKey : TektonResult -> Instant
+
+let endKey r =
+    let text = r.summary.end_time |> Option.defaultValue r.update_time
+    Instant.parse text
+
+/// The PURE selection logic (last-success-sha.fsx `internal logic`): pick
+/// the most-recent result by endKey and read its commit annotation. The
+/// oracle'd core — takes data, not the network.
+let pickSuccessful : Option<seq<TektonResult>> -> RunDiscovery
+
+let pickSuccessful results =
+    match results with
+    | None -> NoneFound
+    | Some rs ->
+        match rs with
+        | [] -> NoneFound
+        | items ->
+            let latest =
+                items
+                |> Seq.sortByDescending endKey
+                |> Seq.tryHead
+            match latest with
+            | None -> NoneSuccessful
+            | Some r ->
+                match commitOf r with
+                | Some commit -> HeadSha commit
+                | None -> NoneSuccessful
+
+// ---- the live Http shaping (structurally checked) ----
+
+/// Tekton context (last-success-sha.fsx first readEnv).
+type TektonContext = {
+    TEKTON_RESULTS_HOST: Option<string>
+}
+
+/// The full Tekton env (last-success-sha.fsx TektonEnv). dbt defaults the
+/// insecure toggle to false and DEBUG is Option.
+type TektonApiEnv = {
+    TEKTON_RESULTS_HOST: string
+    [<Default false>]
+    TEKTON_RESULTS_HOST_INSECURE: bool
+    RESULTS_PARENT: string
+    PIPELINE_NAME: string
+    DBT_SOURCE_BRANCH: string
+    DEBUG: Option<int>
+}
+
+/// Read the service-account bearer token from the mounted file
+/// (last-success-sha.fsx readSaToken). A Secret — it rides argv/headers
+/// in the clear but never renders.
+let readSaToken : unit -> Secret
+
+let readSaToken () =
+    File.readSecret "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+/// The results filter expression (last-success-sha.fsx filter): success +
+/// a pipeline-name regex + the source branch. Built as a plain string;
+/// the query is percent-encoded via Http.withQuery.
+let filterOf : TektonApiEnv -> string
+
+let filterOf env =
+    let pipeExpr = $"annotations['tekton.dev/pipeline'].matches('^{env.PIPELINE_NAME}(-[a-z0-9]+-r)?$')"
+    let branchExpr = $"annotations['branch']=='{env.DBT_SOURCE_BRANCH}'"
+    $"summary.status==SUCCESS&&{pipeExpr}&&{branchExpr}"
+
+/// Fetch the results (last-success-sha.fsx results). The request shape is
+/// what `weir check` proves; a live run needs the host, the SA token, and
+/// network. The insecure toggle maps to the request's `insecure` field.
+let fetchResults : TektonApiEnv -> Option<seq<TektonResult>>
+
+let fetchResults env =
+    let token = readSaToken ()
+    let baseUrl = $"https://{env.TEKTON_RESULTS_HOST}/apis/results.tekton.dev/v1alpha2/parents/{env.RESULTS_PARENT}/results"
+    let url =
+        baseUrl
+        |> Http.withQuery [("filter", filterOf env); ("order_by", "summary.end_time desc"); ("page_size", "50")]
+    let resp =
+        Http.send {
+            Http.get url with
+            secretHeaders = [("Authorization", Secret.map (fun t -> $"Bearer {t}") token)]
+            headers = [("Accept", "application/json")]
+            insecure = env.TEKTON_RESULTS_HOST_INSECURE
+        }
+    if resp.status >= 400 then fail $"Tekton results API returned {resp.status}"
+    resp.body |> from json ResultsResponse |> _.results
+
+/// The full resolve (last-success-sha.fsx getLastSuccessCommitHash):
+/// Skipped with no host; else fetch + the pure logic.
+let getLastSuccessCommitHash : TektonContext -> TektonApiEnv -> RunDiscovery
+
+let getLastSuccessCommitHash context env =
+    match context.TEKTON_RESULTS_HOST with
+    | None -> Skipped
+    | Some _ ->
+        fetchResults env |> pickSuccessful
+
+// ---- deploy-spec (deploy-spec.fsx) ----
+
+/// The Tekton build env (deploy-spec.fsx BuildEnv). PAC template vars.
+type BuildEnv = {
+    [<Default "invalid">]
+    DBT_SOURCE_REPO: string
+    [<Default "unknown">]
+    DBT_SOURCE_BRANCH: string
+    [<Default "00000000">]
+    DBT_REVISION: string
+    [<Default 0>]
+    DBT_RUN_VERSION: int
+}
+
+/// Build the UpdateSpec (deploy-spec.fsx deploymentSpec): new_tag is the
+/// short revision.
+let deploymentSpec : BuildEnv -> PlanOutput -> UpdateSpec
+
+let deploymentSpec env output =
+    Spec.UpdateSpec {
+        source_repo = env.DBT_SOURCE_REPO
+        source_branch = env.DBT_SOURCE_BRANCH
+        new_tag = env.DBT_REVISION[0..6]
+        version = env.DBT_RUN_VERSION
+        change_keys = output.changeKeys
+        images = Spec.imagesOf output
+    }
+
+// ---- output (output.fsx) ----
+
+/// Resolve a Tekton result file path (output.fsx writeToTektonResult):
+/// $RESULT_<name> or ./<name>.txt.
+let resultPath : string -> string
+
+let resultPath resultName =
+    match Env.get $"RESULT_{resultName}" with
+    | Some p -> p
+    | None -> $"./{resultName}.txt"
+
+/// Write a value to a Tekton result (output.fsx writeToTektonResult).
+let writeResult : string -> string -> unit
+
+let writeResult resultName value =
+    let path = resultPath resultName
+    [value] |> File.write path

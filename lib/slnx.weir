@@ -1,0 +1,90 @@
+module Slnx
+
+// A weir-native .slnx solution selector — the maintainer's choice:
+// slnx ONLY, NOT the classic .sln text format.
+//
+// dbt's dotnet/solution.fsx parses the OLD .sln (a bespoke text format,
+// via Ionide.ProjInfo) to build a project graph. The maintainer instead
+// wants the NEW XML solution format (.slnx): `<Solution>` holding
+// `<Project Path="…"/>` elements (optionally nested in `<Folder>`s).
+// That is the csproj win again — a typed XML boundary, `from xml`, no
+// hand-rolled parser. There is NO dbt oracle for this (dbt is .sln), so
+// the harness cross-checks it STRUCTURALLY against a .slnx fixture, and
+// FINDINGS states the oracle gap honestly.
+//
+// The selector's job: a changed .slnx expands to the project files it
+// lists (expand_leafs), so touching a solution rebuilds its members —
+// the .slnx is the unit of discovery, the .csprojs are the leaves.
+
+import "./types.weir" as T
+
+/// One `<Project Path="…"/>` entry. `[<Attr "Path">]` reads the attribute
+/// (the project's path relative to the .slnx file's directory).
+type SlnxProject = {
+    [<Attr "Path">]
+    Path: string
+}
+
+/// A `<Folder>` may nest `<Project>` entries (slnx groups projects into
+/// solution folders). Only the projects matter for discovery.
+type SlnxFolder = {
+    [<Elem "Project">]
+    projects: seq<SlnxProject>
+}
+
+/// The `<Solution>` root: top-level `<Project>`s plus any nested inside
+/// `<Folder>`s. `from xml` maps each field to its child element by local
+/// name; MSBuild's default xmlns is stripped so names stay plain.
+type Solution = {
+    [<Elem "Project">]
+    projects: seq<SlnxProject>
+    [<Elem "Folder">]
+    folders: seq<SlnxFolder>
+}
+
+/// Enumerate every project path a .slnx names (top-level + folder-nested),
+/// resolved relative to the .slnx file's own directory and normalised
+/// (slnx uses '\' or '/' separators; the port reads the attribute text
+/// as-is and normalises the join). Paths come back repo-relative, matching
+/// how the rest of discovery addresses files.
+let projectsOf : string -> seq<string>
+
+let projectsOf slnxPath =
+    let dir = Path.dir slnxPath
+    let doc = File.read slnxPath |> from xml Solution
+    let topLevel = doc.projects
+    let nested = doc.folders |> Seq.collect (fun f -> f.projects)
+    topLevel
+    |> Seq.append nested
+    |> Seq.map (fun p -> p.Path |> Str.replace @"\" "/")
+    |> Seq.map (fun rel -> Path.combine dir rel |> Path.normalize)
+    |> Seq.distinct
+    |> Seq.freeze
+
+/// Leaf expansion (the .slnx analogue of dbt's solution leaf walk): a
+/// changed .slnx expands to its member project files; a changed file
+/// that is not a .slnx passes through unchanged.
+let expandLeafs : LeafContext -> seq<string>
+
+let expandLeafs ctx =
+    if Path.extension ctx.projectPath == ".slnx" then
+        projectsOf ctx.projectPath
+    else
+        [ctx.projectPath]
+
+/// The slnx selector: pattern "*.slnx", every solution required, leaf
+/// expansion enumerates the solution's projects. Include-only (no
+/// excludes), so it needs no Glob exclude member.
+let generic : Selector
+
+let generic =
+    T.Selector {
+        id = "slnx"
+        patterns = ["*.slnx"]
+        excludePatterns = []
+        discoveryRoot = None
+        isRequired = fun _ -> true
+        isIgnored = fun _ -> false
+        projectId = fun p -> p.projectId
+        expandLeafs = expandLeafs
+    }

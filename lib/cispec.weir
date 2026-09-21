@@ -1,0 +1,40 @@
+module CiSpec
+
+// The CI deploy-spec model, ported from fsx/types.fsx (UpdateSpec /
+// ImageSpec) — shared by the github and tekton deploy-spec ports.
+//
+// UpdateSpec is what a deploy-spec emit produces: the source repo/branch,
+// a new image tag (the short SHA), a monotonic version, the change keys,
+// and one ImageSpec per required project. Function-free, so it is
+// `to json`-able — which is the whole point (deploy-spec/output serialise
+// it to a CI output channel).
+
+import "./types.weir" as T
+
+/// One image to deploy (types.fsx ImageSpec). `digest` is filled later by
+/// the build; the deploy-spec emits None.
+type ImageSpec = {
+    name: string
+    digest: Option<string>
+}
+
+/// The deployment update spec (types.fsx UpdateSpec). `change_keys` is the
+/// scraped change-key set (Option: absent in All mode). `version` is a CI
+/// run id — dbt types it int64; weir's json int covers it (see FINDINGS).
+type UpdateSpec = {
+    source_repo: string
+    source_branch: string
+    new_tag: string
+    version: int
+    change_keys: Option<seq<string>>
+    images: seq<ImageSpec>
+}
+
+/// Build the images list from a plan's required projects (the deploy-spec
+/// `for p in requiredProjects -> { name = p.projectId; digest = None }`).
+let imagesOf : PlanOutput -> seq<ImageSpec>
+
+let imagesOf output =
+    output.requiredProjects
+    |> Seq.map (fun p -> ImageSpec { name = p.projectId; digest = None })
+    |> Seq.freeze

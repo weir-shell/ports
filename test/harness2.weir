@@ -1,0 +1,195 @@
+#!/usr/bin/env weir
+
+// Stage-2 harness: exercises the new selectors (bicep, node, slnx), the
+// Selector.extend helper, snapshot write/validate, and the CI integrations
+// (pure logic + deploy-spec JSON shaping). Self-contained: builds a temp
+// git monorepo, cds in, asserts on discovered projects / snapshot / specs.
+//
+// Oracle status per slice is stated in FINDINGS; here every assert is
+// exit-code (fail => exit 1).
+
+import "./../lib/types.weir" as T
+import "./../lib/plan.weir" as Dbt
+import "./../lib/discover.weir" as Discover
+import "./../lib/selector.weir" as Sel
+import "./../lib/bicep.weir" as Bicep
+import "./../lib/node.weir" as Node
+import "./../lib/slnx.weir" as Slnx
+import "./../lib/snapshot.weir" as Snapshot
+import "./../lib/cispec.weir" as Spec
+import "./../lib/ci_github.weir" as Gh
+
+let assert cond msg =
+    if not cond then fail $"ASSERT FAILED: {msg}"
+    else print $"ok: {msg}"
+
+// ---- build the fixture monorepo ----
+let root = Path.newTempDir ()
+Dir.create $"{root}/infra/network"
+Dir.create $"{root}/infra/env"
+Dir.create $"{root}/web"
+Dir.create $"{root}/sln/A"
+Dir.create $"{root}/sln/B"
+
+// bicep: a module + a param referencing it (the param is the leaf)
+["// network module"; "param location string"] |> File.write $"{root}/infra/network/main.bicep"
+["using '../network/main.bicep'"; "param location = 'westeurope'"] |> File.write $"{root}/infra/env/prod.bicepparam"
+
+// node: a package.json project
+["{\"name\": \"web\", \"version\": \"1.0.0\"}"] |> File.write $"{root}/web/package.json"
+
+// slnx: a solution naming two csprojs (one nested in a Folder)
+["<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"] |> File.write $"{root}/sln/A/A.csproj"
+["<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"] |> File.write $"{root}/sln/B/B.csproj"
+let slnxDoc = [
+    "<Solution>"
+    "  <Project Path=\"A/A.csproj\" />"
+    "  <Folder Name=\"/tests/\">"
+    "    <Project Path=\"B/B.csproj\" />"
+    "  </Folder>"
+    "</Solution>"
+]
+slnxDoc |> File.write $"{root}/sln/app.slnx"
+
+within cd root
+    let _i = git init -q | complete
+    let _n = git config user.name t | complete
+    let _e = git config user.email t@t | complete
+    let _a = git add -A | complete
+    let _c = git commit -qm "init" | complete
+
+    // ---------- BICEP SELECTOR ----------
+    print "== BICEP =="
+    // simulate a change set: both bicep files changed
+    let bicepDirs = Map.ofPairs [
+        ("infra/network", ["infra/network/main.bicep"])
+        ("infra/env", ["infra/env/prod.bicepparam"])
+    ]
+    let bicepProjects =
+        Discover.findRequiredProjects bicepDirs false Bicep.generic
+        |> Seq.map (fun p -> p.relativePath)
+        |> Seq.sort
+        |> Seq.freeze
+    // only the .bicepparam is a required leaf; the walk-up finds the param
+    // files matching *.bicep/*.bicepparam in their dirs, and required=param
+    assert (Seq.contains "infra/env/prod.bicepparam" bicepProjects) "bicep: prod.bicepparam is a required leaf"
+    assert (not (Seq.contains "infra/network/main.bicep" bicepProjects)) "bicep: bare .bicep module is not required (not a leaf)"
+    // dependency-tree parse: prod.bicepparam references main.bicep
+    let imports = Bicep.parseImports "infra/env/prod.bicepparam" |> Seq.freeze
+    assert (Seq.contains "infra/network/main.bicep" imports) "bicep: parseImports resolves 'using' ref to main.bicep"
+
+    // ---------- NODE SELECTOR ----------
+    print "== NODE =="
+    let nodeDirs = Map.ofPairs [("web", ["web/package.json"])]
+    let nodeProjects =
+        Discover.findRequiredProjects nodeDirs false Node.image
+        |> Seq.map (fun p -> p.relativePath)
+        |> Seq.freeze
+    assert (Seq.equal nodeProjects ["web/package.json"]) "node: package.json discovered as the project"
+    let nodeKind =
+        Discover.findRequiredProjects nodeDirs false Node.image
+        |> Seq.map (fun p -> p.kind)
+        |> Seq.distinct
+        |> Seq.freeze
+    assert (Seq.equal nodeKind ["node"]) "node: kind is node"
+
+    // ---------- SLNX SELECTOR (structural — no dbt oracle) ----------
+    print "== SLNX =="
+    // projectsOf enumerates the solution's members (top-level + folder)
+    let slnProjects = Slnx.projectsOf "sln/app.slnx" |> Seq.sort |> Seq.freeze
+    assert (Seq.equal slnProjects ["sln/A/A.csproj"; "sln/B/B.csproj"]) "slnx: enumerates both projects (top-level + folder-nested)"
+    // through the selector: a changed .slnx expands to its member projects
+    let slnxDirs = Map.ofPairs [("sln", ["sln/app.slnx"])]
+    let slnxDiscovered =
+        Discover.findRequiredProjects slnxDirs false Slnx.generic
+        |> Seq.map (fun p -> p.relativePath)
+        |> Seq.sort
+        |> Seq.freeze
+    assert (Seq.equal slnxDiscovered ["sln/A/A.csproj"; "sln/B/B.csproj"]) "slnx: changed .slnx expands (leaf) to its member csprojs"
+
+    // ---------- Selector.extend ----------
+    print "== EXTEND =="
+    // extend node with an extra pattern and an id override — plain merge
+    let nodeExt = Sel.extend Node.image { Sel.noOverrides with id = Some "node-ext"; addPatterns = ["package.json5"] }
+    assert (nodeExt.id == "node-ext") "extend: id overrides"
+    assert (Seq.equal (nodeExt.patterns |> Seq.freeze) ["package.json"; "package.json5"]) "extend: patterns append (base first, then added)"
+    // base functions inherited: isRequired still always-true
+    assert (nodeExt.isRequired "anything") "extend: inherited isRequired (always true) preserved"
+
+    // ---------- SNAPSHOT write/validate ----------
+    print "== SNAPSHOT =="
+    let out = T.PlanOutput {
+        requiredProjects = [
+            T.ProjectMetadata {
+                fileName = "A.csproj"; fileNameNoExtension = "A"; fullPath = "sln/A/A.csproj"
+                fullDir = "sln/A"; dir = "A"; dirSlug = "a"; relativePath = "sln/A/A.csproj"
+                relativeDir = "sln/A"; projectId = "sln-a"; kind = "slnx"
+            }
+        ]
+        changeKeys = Some ["CHANGE-KEY-x"]
+        changeSetRange = Some (T.ChangeSetRange { baseCommits = ["bbbbbbbccc"]; currentCommit = "aaaaaaaddd" })
+        changedDirs = Some (Map.ofPairs [("sln", ["sln/app.slnx"])])
+    }
+    let snapDir = Path.newTempDir ()
+    let written = Snapshot.write snapDir "default" out
+    assert (File.exists written) "snapshot: write produced a file"
+    // validate against the same output => Match
+    let v1 = Snapshot.validate snapDir "default" out
+    let isMatch = match v1 with | Match _ -> true | _ -> false
+    assert isMatch "snapshot: validate matches the same output"
+    // mutate a SNAPSHOTTED field (changedDirs — changeKeys is NOT in the
+    // snapshot, matching dbt's SnapshotRecord) => Mismatch
+    let out2 = { out with changedDirs = Some (Map.ofPairs [("sln", ["sln/app.slnx"; "sln/extra.txt"])]) }
+    let v2 = Snapshot.validate snapDir "default" out2
+    let isMismatch = match v2 with | Mismatch _ -> true | _ -> false
+    assert isMismatch "snapshot: validate detects a changed output (mismatch)"
+    // missing snapshot => Missing
+    let v3 = Snapshot.validate snapDir "other-profile" out
+    let isMissing = match v3 with | Missing _ -> true | _ -> false
+    assert isMissing "snapshot: validate reports a missing snapshot file"
+    Dir.deleteAll snapDir
+
+    // ---------- CI: github pure logic (oracle'd structurally) ----------
+    print "== CI GITHUB LOGIC =="
+    let mkStep c = Gh.Step { conclusion = Some c }
+    let greenJob = Gh.Job { steps = [mkStep "success"; mkStep "skipped"] }
+    let redJob = Gh.Job { steps = [mkStep "success"; mkStep "failure"] }
+    let runs = [Gh.WorkflowRun { id = 10; head_sha = "sha10" }; Gh.WorkflowRun { id = 20; head_sha = "sha20" }]
+    // run 20 is red, run 10 is green => pick sha10 (highest green id)
+    let jobsOf id = if id == 20 then [redJob] else [greenJob]
+    let picked = Gh.pickSuccessful runs jobsOf
+    let pickedSha = match picked with | HeadSha s -> s | _ -> "none"
+    assert (pickedSha == "sha10") "github: pickSuccessful picks the highest-id fully-green run"
+    // no runs => NoneFound
+    let none = Gh.pickSuccessful [] jobsOf
+    let isNoneFound = match none with | NoneFound -> true | _ -> false
+    assert isNoneFound "github: empty runs => NoneFound"
+    // all red => NoneSuccessful
+    let allRed = Gh.pickSuccessful runs (fun _ -> [redJob])
+    let isNoneSucc = match allRed with | NoneSuccessful -> true | _ -> false
+    assert isNoneSucc "github: all-red runs => NoneSuccessful"
+    // workflowIdOf: last path segment before @
+    assert (Gh.workflowIdOf "owner/repo/.github/workflows/ci.yml@refs/heads/main" == "ci.yml") "github: workflowIdOf extracts the workflow file"
+
+    // ---------- CI: github deploy-spec (JSON shaping, oracle-comparable) ----------
+    print "== CI GITHUB DEPLOY-SPEC =="
+    let ghEnv = Gh.BuildEnv {
+        GITHUB_REPOSITORY = "acme/app"
+        GITHUB_REF_NAME = "main"
+        GITHUB_SHA = "abcdef01234567"
+        GITHUB_RUN_ID = 42
+    }
+    let ghSpec = Gh.deploymentSpec ghEnv out
+    assert (ghSpec.new_tag == "abcdef0") "github: new_tag is the 7-char short SHA"
+    assert (ghSpec.source_repo == "acme/app") "github: source_repo from env"
+    assert (ghSpec.version == 42) "github: version from GITHUB_RUN_ID"
+    let ghImages = ghSpec.images |> Seq.map (fun i -> i.name) |> Seq.freeze
+    assert (Seq.equal ghImages ["sln-a"]) "github: one image per required project"
+    // the spec is to-json-able (function-free)
+    let ghJson = ghSpec |> to json |> Seq.freeze |> Str.join "\n"
+    assert (ghJson |> Str.contains "\"new_tag\":\"abcdef0\"") "github: deploy-spec serialises to JSON"
+
+    print "== all Stage-2 asserts passed =="
+
+Dir.deleteAll root
+print "STAGE-2 ALL GREEN"

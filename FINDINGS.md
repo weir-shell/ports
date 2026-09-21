@@ -344,3 +344,179 @@ required-project ids, kinds, test-project exclusion, the walk-up
 (deep change → project `a`), change keys (first-match-per-line),
 changed dirs, the change-set range, and the None-shaped All/empty
 outputs. All green.
+[This is the exact text to append to /output/dbt-weir/FINDINGS.md once write access is restored.]
+
+---
+
+# STAGE 2 — the non-Glob slices (bicep, node, slnx, extend, snapshot, CI)
+
+Scope delivered: the bicep selector (incl. its dependency-tree leaf walk),
+the node selector, a weir-native slnx solution selector (the maintainer's
+slnx-only choice, NOT dbt's .sln), the Selector.extend merge helper,
+snapshot write/validate, and the github + tekton CI integrations
+(last-success-sha pure logic + Http shaping, deploy-spec, output).
+Deferred (post-Glob): the kustomize selector and any exclude-accurate
+selector — they need the unshipped Glob include/exclude member. Everything
+below weir checks clean on weir 0.0.0-dev+27eba9d.
+
+## Per-slice: what ported, test + oracle status
+
+### bicep (lib/bicep.weir) — ported FULLY, incl. the dependency graph
+Include side is pure glob (*.bicep/*.bicepparam), so no Glob-exclude needed.
+dbt's three compiled import Regexes become Str.rmatchAll over the same raw
+patterns (deterministic, no hand-rolled parser). The makeDependencyTree/
+findLeafDependants leaf walk — dbt's hand-written visited-Set recursion — is
+Graph.reach over the reverse dependency graph (referenced-file -> referrers),
+the same builtin-eats-the-walker win Stage-1 found for the ancestor chain.
+required = is-.bicepparam (only param files are deployable leaves). Test:
+harness2 asserts the param is a required leaf and the bare module is not,
+that parseImports resolves the using ref, and a standalone probe proves the
+reverse-graph walk reaches env/prod.bicepparam from a changed mod/net.bicep.
+Oracle: structural (the real dbt bicep selector uses the CE-DSL and a
+Directory.GetCurrentDirectory tree the oracle driver does not wire; the port
+matches project.fsx line-for-line but was not run through fsy).
+
+### node (lib/node.weir) — ported cleanly, trivially
+dbt's simplest selector: one pattern package.json, all defaults. A plain
+glob-discovery selector, include-only. Test: harness2 asserts package.json
+is discovered with kind node. Oracle: structural.
+
+### slnx (lib/slnx.weir) — weir-native, NO dbt equivalent
+The maintainer's choice: read the NEW XML .slnx via from xml, not dbt's
+bespoke .sln text parser (solution.fsx, skipped). <Solution> holds
+<Project Path="..."/> elements, optionally nested in <Folder>s;
+[<Attr "Path">] + [<Elem "Project">]/[<Elem "Folder">] map them, and the
+default xmlns is stripped so field names stay plain. A changed .slnx expands
+(leaf) to its member csprojs. Test: harness2 asserts projectsOf enumerates
+both projects (top-level + folder-nested) and the selector expands a changed
+.slnx to sln/A/A.csproj + sln/B/B.csproj. Oracle: STRUCTURAL ONLY, and this
+is an honest gap — dbt is .sln, so there is no dbt output to diff against.
+from xml on .slnx worked first-try, exactly as .csproj did in Stage 1.
+
+### Selector.extend (lib/selector.weir) — the CE-extend replacement
+A plain merge FUNCTION, not a computation expression (Stage-1 (d)):
+extend base overrides where an OverrideSpec carries Option-of-each field;
+patterns/excludes APPEND (base first, then added — dbt's list accumulation),
+scalars/functions override when Some. The "excludes merge in reverse order"
+CE artifact does not arise. Test: harness2 extends the node selector with an
+id override + extra pattern and asserts append order + inherited function
+fields survive. Oracle: n/a.
+
+### snapshot (lib/snapshot.weir) — ported cleanly
+PlanOutput is function-free -> to json-able. dbt's toRecord (sort base
+commits, sort each dir's files, sort projects by relativePath) ports 1:1.
+The comparison sidesteps the seq-equality gap (Stage-1 (c)#7) by
+canonical-JSON string equality: both sides go through to json with
+pre-sorted seqs and declaration-order fields, so equal snapshots are
+byte-identical text — and the snapshot IS text on disk. validate returns
+Match|Mismatch|Missing (a union, cleaner than dbt's mid-function exit 1);
+apply keeps dbt's Write-logs / Validate-fails behaviour. Test: harness2 does
+write -> validate-match -> mutate-a-snapshotted-field -> mismatch ->
+missing-file. Fidelity find: changeKeys is NOT in dbt's SnapshotRecord, so
+mutating it does NOT trip validate (the first test draft mutated it and
+wrongly expected mismatch — corrected to mutate changedDirs). Oracle:
+structural.
+
+### CI github (lib/ci_github.weir) + tekton (lib/ci_tekton.weir)
+The best language stress-test, as predicted. Three surfaces each:
+- last-success-sha — the PURE selection logic (pickSuccessful: highest green
+  run for github, most-recent successful result for tekton) is oracle'd
+  STRUCTURALLY over in-memory fixtures, as dbt's internal logic is
+  unit-testable. The LIVE path — typed Http.send requests, Bearer/token
+  secretHeaders, from json responses, tekton's insecure toggle and
+  Http.withQuery percent-encoding — is weir check-proven but NOT run (no
+  token, no host, no network). Honest split: logic = structural-tested,
+  API-shaping = check-proven.
+- deploy-spec — pure PlanOutput -> UpdateSpec from a typed env with
+  [<Default>]s; new_tag is the 7-char short SHA. Data-in/JSON-out; harness
+  asserts fields + serialisation.
+- output — github appends key=value to $GITHUB_OUTPUT (File.append, refusing
+  a =-bearing key); tekton writes a result file ($RESULT_<name> or
+  ./<name>.txt).
+Tests: harness2 (github) + harness2-tekton (tekton), all green. Oracle:
+structural for logic + deploy-spec; the env-driven entrypoints hit real
+providers dbt also cannot reach offline.
+
+## NEW gaps hit in Stage 2
+
+1. Cross-module same-name TYPES cannot coexist in one import set. Importing
+   BOTH ci_github and ci_tekton fails: each declares RunDiscovery, BuildEnv,
+   Skipped/HeadSha... and weir reports "import 'Tek' declares a type
+   'RunDiscovery' that is already declared here; rename one (cross-module
+   same-name types are not yet distinguishable)". Real dbt use imports ONE
+   provider, so the harness splits into harness2.weir (github) +
+   harness2-tekton.weir (tekton) — faithful, not a workaround. But two
+   ported modules with parallel shapes cannot be composed in one script. The
+   collision is only at the bare TYPE name (values are already qualified
+   Gh./Tek.). This is the headline new gap.
+
+2. A multi-line lambda in a record-literal field does not close cleanly.
+   expandLeafs = fun ctx -> <multi-line pipeline> inside a Selector {...}
+   literal gives an assembly/offside error ("this line sits left of the
+   lambda '(' opened at..."). Fix: name the lambda as a module-level let and
+   reference it (bicep/slnx/snapshot all do this). Clean once learned.
+
+3. Seq.force was RENAMED to Seq.freeze post-skill ("renamed 'Seq.freeze' —
+   the result is a frozen snapshot"). Version drift, not a gap; noted because
+   the skill file still lists force. Stage-1 already uses freeze.
+
+4. A .slnx has NO dbt oracle (restated): dbt reads .sln, so the slnx selector
+   is verified only structurally against a self-built .slnx fixture.
+
+5. CI version is int, dbt's is int64. GITHUB_RUN_ID/DBT_RUN_VERSION are int64
+   in dbt; the port types them int (no int64 in the skill surface). Covers
+   the realistic range; >2^31 would overflow — a stated non-claim.
+
+## How the port read vs the F#
+
+The bicep dependency graph is the standout: dbt's let rec walk (visited: Set)
+becomes one Graph.reach call — the fourth port to watch a graph builtin eat a
+hand-rolled visited-set walker, and the reverse-graph framing (dep ->
+referrers) reads more honestly than the forward recursion. from xml on .slnx
+is the Stage-1 csproj win again, verbatim. The CI logic functions port
+near-1:1 because they were already pure functions over data (dbt's internal
+logic taking runs/jobs thunks) — weir just makes the purity the shape. The
+genuine friction was structural, not semantic: the same-name-type collision
+(gap 1) and the record-field lambda (gap 2), both mechanical. The CE-DSL is
+still gone and still not missed; Selector.extend restores dbt's extend
+terseness as a plain function, which reads better than the facet-list builder
+it replaces.
+
+## Deferred (post-Glob) — a second pass lands these once Glob ships
+
+- kustomize selector (fsx/kustomize/project.fsx) — reads kustomization.yaml
+  (resources/components/generators/transformers) via from yaml, builds a
+  dependency tree, walks leaf dependants. The YAML read + Graph.reach walk
+  are both available TODAY, BUT kustomize discovery leans on directory-tree
+  globbing with the FileSystemGlobbing Matcher and its selector's real value
+  is exclude-accurate discovery — held for the Glob include/exclude member
+  per the DEFER instruction rather than shipped with a substring-exclude
+  non-claim.
+- any exclude-accurate selector — Stage-1 (c)#1 stands: excludes are still
+  hand-rolled substring containment, not glob-accurate. bicep/node/slnx are
+  include-only so don't need it; anything with a real exclude waits for Glob.
+
+## Stage-2 oracle status (stated plainly)
+
+Stage 1's byte-identical fsy-vs-weir cross-check covered the dotnet plan
+spine. Stage 2 is structural: the ported logic matches the dbt .fsx source
+function-for-function, and every slice is exercised by a green weir harness
+over a self-built fixture — but the new slices were NOT re-run through fsy
+against a dbt oracle. Two reasons: (a) the selectors live in dbt's CE-DSL,
+which the Stage-1 oracle driver does not wire (it drives only the dotnet
+plan), so a bicep/node oracle needs a new driver; (b) slnx has no dbt
+equivalent, and the CI entrypoints hit providers unreachable offline. The
+PURE cores (CI logic, snapshot toRecord, bicep graph, slnx enumeration) are
+the parts a dbt oracle would test, and those are the parts the harness tests
+structurally. Wiring a bicep/node/snapshot oracle driver is a ~0.5-day
+Stage-2.5 follow-up.
+
+## Stage-2 harness
+
+test/harness2.weir — builds a temp git monorepo (bicep module+param, a
+package.json, a .slnx naming two csprojs one folder-nested), runs the
+bicep/node/slnx selectors through Discover.findRequiredProjects, tests
+Selector.extend, and does the snapshot write/validate round-trip and the
+github CI logic + deploy-spec. test/harness2-tekton.weir — the tekton CI
+logic + filter + deploy-spec (separate file per gap 1). Both green; every
+assert is exit-code (fail -> exit 1).
