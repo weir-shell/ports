@@ -45,7 +45,7 @@ jobs:
             else
               echo "FAIL $f"; weir check "$f" 2>&1 | sed 's/^/     /'; fail=1
             fi
-          done < <(find asdf acme ring -name '*.weir' -not -path '*/probes/*' | sort)
+          done < <(find asdf acme ring dbt -name '*.weir' -not -path '*/probes/*' | sort)
           exit $fail
 
       - name: asdf harness
@@ -61,3 +61,12 @@ jobs:
       - name: ring harness
         working-directory: ring
         run: bash test/run.sh
+
+      # the self-contained dbt harnesses (harness-sln / snapshots need the
+      # external arquidevio/test-dbt fixture — out of scope for CI)
+      - name: dbt harness
+        working-directory: dbt
+        run: |
+          weir test/harness.weir
+          weir test/harness2.weir
+          weir test/harness2-tekton.weir
