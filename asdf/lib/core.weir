@@ -333,13 +333,11 @@ let pluginList () =
 // ---- plugin callback invocation (the key redesign) --------------------
 
 // run one plugin callback script as an EXTERNAL PROGRAM with an env
-// overlay, returning its stdout lines. The head is a RUNTIME path, and
-// weir command heads must be LITERAL, so this goes through `sh -c` with
-// the path single-quoted [FINDING: forced fallback].
+// overlay, returning its stdout lines. The head is a RUNTIME path: the
+// `^$` dynamic head runs it directly, injection-safe (args splat as
+// literal argv words — no shell, no hand-quoting).
 let runCallback script env args =
-    let quoted = args |> Seq.map (fun a -> $"'{a}'") |> Str.join " "
-    let line = $"'{script}' {quoted}"
-    $env(sh -c $"{line}")
+    $env(^$script $@args)
 
 let execPaths plugin version =
     let ppath = pluginPath plugin

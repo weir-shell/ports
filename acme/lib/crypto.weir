@@ -69,8 +69,8 @@ let ecJwk keyfile =
     let pointHex =
         openssl pkey -in $keyfile -pubout -outform DER
         | od -A n -v -t x1
-        |> Seq.map Str.trim
-        |> Seq.fold (fun acc x -> acc + (Str.replace " " "" x)) ""
+        |> Seq.map (fun x -> x |> Str.trim |> Str.replace " " "")
+        |> Str.join ""
     // the uncompressed point marker 0x04 begins the coordinates; find it as the
     // final 0x04-prefixed run. For NIST P-curves the SPKI header is fixed, so
     // the point is the trailing (1 + 2*coordLen) bytes with a leading 04.
@@ -117,15 +117,13 @@ let ecThumbprint jwk =
 let signRs256 : string -> string -> string
 
 let signRs256 keyfile signingInput =
-    let tmp = Path.newTempDir ()
-    let inFile = $"{tmp}/input"
-    let sigFile = $"{tmp}/sig.bin"
-    [signingInput] |> File.write inFile
-    // openssl dgst -sha256 -sign key -out sig input
-    let _r = openssl dgst -sha256 -sign $keyfile -out $sigFile $inFile | orFail "openssl sign failed"
-    let sig = File.readBytes sigFile |> Enc.bytesToB64url
-    Dir.deleteAll tmp
-    sig
+    within tmp d
+        let inFile = $"{d}/input"
+        let sigFile = $"{d}/sig.bin"
+        [signingInput] |> File.write inFile
+        // openssl dgst -sha256 -sign key -out sig input
+        let _r = openssl dgst -sha256 -sign $keyfile -out $sigFile $inFile | orFail "openssl sign failed"
+        File.readBytes sigFile |> Enc.bytesToB64url
 
 /// Sign with an EC key (ES256/384/512). openssl emits a DER ECDSA signature
 /// (SEQUENCE of r,s); JWS needs the fixed-width R||S concatenation. We parse r
@@ -134,29 +132,25 @@ let signRs256 keyfile signingInput =
 let signEs : string -> int -> string -> string
 
 let signEs keyfile coordLen signingInput =
-    let tmp = Path.newTempDir ()
-    let inFile = $"{tmp}/input"
-    let derFile = $"{tmp}/sig.der"
-    [signingInput] |> File.write inFile
-    let hashAlg = $"-sha{coordLen * 8}"
-    let _r = openssl dgst $hashAlg -sign $keyfile -out $derFile $inFile | orFail "openssl EC sign failed"
-    // asn1parse yields two INTEGER lines with ":HEX" tails.
-    let ints =
-        openssl asn1parse -inform DER -in $derFile
-        |> Seq.choose (function
-            | Regex @"INTEGER +:([0-9A-Fa-f]+)" h -> Some (Str.toLower h)
-            | _ -> None)
-        |> Seq.freeze
-    let width = coordLen * 2
-    let pad h =
-        // left-pad hex to `width`, or trim a leading 00 that DER adds for sign.
-        if (Str.length h) > width then h |> Str.sub ((Str.length h) - width) width
-        else
-            let need = width - (Str.length h)
-            let zeros = Seq.replicate need "0" |> Seq.fold (fun a x -> a + x) ""
-            zeros + h
-    let rHex = pad (Seq.item 0 ints)
-    let sHex = pad (Seq.item 1 ints)
-    let sig = Enc.hexToB64url (rHex + sHex)
-    Dir.deleteAll tmp
-    sig
+    within tmp d
+        let inFile = $"{d}/input"
+        let derFile = $"{d}/sig.der"
+        [signingInput] |> File.write inFile
+        let hashAlg = $"-sha{coordLen * 8}"
+        let _r = openssl dgst $hashAlg -sign $keyfile -out $derFile $inFile | orFail "openssl EC sign failed"
+        // asn1parse yields two INTEGER lines with ":HEX" tails.
+        let ints =
+            openssl asn1parse -inform DER -in $derFile
+            |> Seq.choose (function
+                | Regex @"INTEGER +:([0-9A-Fa-f]+)" h -> Some (Str.toLower h)
+                | _ -> None)
+            |> Seq.freeze
+        let width = coordLen * 2
+        let pad h =
+            // left-pad hex to `width`, or trim a leading 00 that DER adds for sign.
+            if (Str.length h) > width then h |> Str.sub ((Str.length h) - width) width
+            else
+                Str.replicate (width - (Str.length h)) "0" + h
+        let rHex = pad (Seq.item 0 ints)
+        let sHex = pad (Seq.item 1 ints)
+        Enc.hexToB64url (rHex + sHex)

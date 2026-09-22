@@ -16,8 +16,7 @@ import "./crypto.weir" as Crypto
 
 // The flattened JWS document (what gets POSTed).
 type FlatJws = {
-    [<Wire "protected">]
-    protectedField: string
+    protected: string
     payload: string
     signature: string
 }
@@ -36,7 +35,7 @@ let flatten : string -> string -> string -> string
 
 let flatten protected64 payload64 sig =
     let doc = {
-        protectedField = protected64
+        protected = protected64
         payload = payload64
         signature = sig
     }

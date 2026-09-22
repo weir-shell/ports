@@ -130,7 +130,7 @@ let bytesValsToB64 vals =
         let c2 = if has1 then b64char ((b1 % 16) * 4 + b2 / 64) else "="
         let c3 = if has2 then b64char (b2 % 64) else "="
         c0 + c1 + c2 + c3)
-    |> Seq.fold (fun acc x -> acc + x) ""
+    |> Str.join ""
 
 /// hex string -> base64url (the acme.sh `_h2b | _base64 | _url_replace` chain).
 let hexToB64url : string -> string
@@ -180,4 +180,4 @@ let bytesToHex b =
     bytesOut
     |> Seq.take totalBytes
     |> Seq.map byteToHex
-    |> Seq.fold (fun a x -> a + x) ""
+    |> Str.join ""

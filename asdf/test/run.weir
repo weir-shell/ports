@@ -9,8 +9,9 @@
 // nested dir to exercise the upward .tool-versions walk, and points
 // ASDF_DATA_DIR at the fixture data dir.
 
-// seq<string> has no ==; compare by joining on a newline [FINDING].
-let seqEq a b = (a |> Str.join "\n") == (b |> Str.join "\n")
+// element-wise, length-sensitive seq comparison (Seq.equal is the spelling
+// that retires the lossy join-then-compare).
+let seqEq a b = Seq.equal a b
 
 let here = Path.dir Self.scriptPath
 let fixtures = Path.combine here "fixtures"
