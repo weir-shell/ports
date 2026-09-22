@@ -1,0 +1,127 @@
+#!/usr/bin/env weir
+
+// Harness: build a fixture monorepo, run Plan.evaluate in Diff and All
+// modes, ASSERT the required-projects / change-keys / changed-dirs match
+// expectations. Asserts are exit-code (fail => exit 1), not console eyeballing.
+//
+// Run from anywhere; it makes its own temp git repo and cds into it.
+
+import "./../lib/types.weir" as T
+import "./../lib/plan.weir" as Dbt
+import "./../lib/dotnet.weir" as Dotnet
+
+let assert cond msg =
+    if not cond then fail $"ASSERT FAILED: {msg}"
+    else print $"ok: {msg}"
+
+// ---- build the fixture repo ----
+let root = Path.newTempDir ()
+Dir.create $"{root}/a"
+Dir.create $"{root}/b"
+Dir.create $"{root}/c/nested"
+
+let csproj body = [$"<Project><PropertyGroup>{body}</PropertyGroup></Project>"]
+csproj "<TargetFramework>net10.0</TargetFramework>" |> File.write $"{root}/a/x.csproj"
+csproj "<IsTestProject>true</IsTestProject>" |> File.write $"{root}/b/y.csproj"
+csproj "<TargetFramework>net10.0</TargetFramework>" |> File.write $"{root}/c/nested/z.fsproj"
+["hello"] |> File.write $"{root}/a/Program.cs"
+["world"] |> File.write $"{root}/c/nested/Lib.fs"
+["readme"] |> File.write $"{root}/README.md"
+
+within cd root
+    let _i = git init -q | complete
+    let _n = git config user.name t | complete
+    let _e = git config user.email t@t | complete
+    let _a1 = git add -A | complete
+    let _c1 = git commit -qm "init: [CHANGE-KEY-base] baseline" | complete
+    let baseSha = git rev-parse HEAD |> Seq.exactlyOne |> Str.trim
+    // change a file DEEP below a/'s project file, to exercise the
+    // ancestor walk-up (findParentProjectPath): a/deep/sub/n.cs has no
+    // project of its own; the nearest ancestor project is a/x.csproj.
+    Dir.create $"{root}/a/deep/sub"
+    ["nested change"] |> File.write $"{root}/a/deep/sub/n.cs"
+    ["world"; "touch"] |> File.write $"{root}/c/nested/Lib.fs"
+    let _a2 = git add -A | complete
+    let _c2 = git commit -qm "feat: a and c [CHANGE-KEY-feat1] and [CHANGE-KEY-feat2]" | complete
+    let curSha = git rev-parse HEAD |> Seq.exactlyOne |> Str.trim
+
+    let profile = T.Profile {
+        id = "default"
+        includeRootDir = false
+        changeKeyRegex = Some @"(CHANGE-KEY-[a-z0-9]+)"
+        selector = Dotnet.generic
+    }
+    let buildPlan = T.BuildPlan {
+        profiles = Map.ofPairs [("default", profile)]
+        range = None
+    }
+
+    // ---- DIFF MODE ----
+    print "== DIFF =="
+    let diffEnv = Dbt.DbtEnv {
+        DBT_MODE = Some T.Diff
+        DBT_PROFILE = "default"
+        DBT_CURRENT_COMMIT = Some curSha
+        DBT_BASE_COMMIT = Some baseSha
+        DBT_PR_TARGET_BRANCH = None
+    }
+    let diff = Dbt.evaluate diffEnv buildPlan
+    let diffIds = diff.requiredProjects |> Seq.map (fun p -> p.projectId) |> Seq.freeze
+    assert (Seq.equal diffIds ["a"; "c/nested"]) "diff: required projects are a, c/nested"
+    let diffKinds = diff.requiredProjects |> Seq.map (fun p -> p.kind) |> Seq.distinct |> Seq.freeze
+    assert (Seq.equal diffKinds ["dotnet"]) "diff: all projects are kind dotnet"
+    assert (not (diffIds |> Seq.contains "b")) "diff: test project b is excluded"
+    let diffKeys =
+        match diff.changeKeys with
+        | Some ks -> ks |> Seq.freeze
+        | None -> []
+    assert (Seq.equal diffKeys ["CHANGE-KEY-feat1"]) "diff: change key is CHANGE-KEY-feat1 (first match per line)"
+    let diffDirs =
+        match diff.changedDirs with
+        | Some d -> d |> Map.keys |> Seq.freeze
+        | None -> []
+    assert (Seq.equal diffDirs ["a/deep/sub"; "c/nested"]) "diff: changed dirs are a/deep/sub, c/nested (deep file)"
+    assert (Seq.equal diffIds ["a"; "c/nested"]) "diff: deep change under a/ still maps to project a via walk-up"
+    let diffRange =
+        match diff.changeSetRange with
+        | Some r -> r
+        | None -> fail "diff: expected a change-set range"
+    assert (diffRange.currentCommit == curSha) "diff: range current commit matches"
+    assert (Seq.contains baseSha diffRange.baseCommits) "diff: range base commits contain base sha"
+
+    // ---- ALL MODE ----
+    print "== ALL =="
+    let allEnv = Dbt.DbtEnv {
+        DBT_MODE = Some T.All
+        DBT_PROFILE = "default"
+        DBT_CURRENT_COMMIT = None
+        DBT_BASE_COMMIT = None
+        DBT_PR_TARGET_BRANCH = None
+    }
+    let allOut = Dbt.evaluate allEnv buildPlan
+    let allIds = allOut.requiredProjects |> Seq.map (fun p -> p.projectId) |> Seq.freeze
+    assert (Seq.equal allIds ["a"; "c/nested"]) "all: required projects are a, c/nested (b excluded)"
+    let noKeys = match allOut.changeKeys with | None -> true | Some _ -> false
+    assert noKeys "all: no change keys"
+    let noDirs = match allOut.changedDirs with | None -> true | Some _ -> false
+    assert noDirs "all: no changed dirs"
+    let noRange = match allOut.changeSetRange with | None -> true | Some _ -> false
+    assert noRange "all: no change-set range"
+
+    // ---- empty diff (base==current) ----
+    print "== EMPTY DIFF =="
+    let emptyEnv = Dbt.DbtEnv {
+        DBT_MODE = Some T.Diff
+        DBT_PROFILE = "default"
+        DBT_CURRENT_COMMIT = Some curSha
+        DBT_BASE_COMMIT = Some curSha
+        DBT_PR_TARGET_BRANCH = None
+    }
+    let emptyOut = Dbt.evaluate emptyEnv buildPlan
+    assert (emptyOut.requiredProjects |> Seq.isEmpty) "empty: no required projects when base==current"
+
+    // ---- unknown profile fails ----
+    print "== all asserts passed =="
+
+Dir.deleteAll root
+print "ALL GREEN"

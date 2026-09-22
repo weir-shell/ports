@@ -1,0 +1,105 @@
+module Types
+
+/// dbt's build-plan model, ported from fsx/types.fsx.
+///
+/// NAME NOTE: dbt's `Plan` value collides with weir's `plan` keyword
+/// (the dry-run mutation-capture head). They are unrelated concepts, so
+/// this port names the config value `BuildPlan` and the evaluator
+/// `Plan.evaluate` lives in lib/plan.weir. weir's own `plan` could NOT
+/// model this: `plan` captures FS/HTTP mutations of a block; dbt's
+/// evaluate is a pure computation over git + globs producing a report.
+
+/// A base-commit resolution strategy (git-diff.fsx BaseCommitStrategy).
+type BaseStrategy =
+    | Override of string
+    | Parent
+    | MergeBase of string
+
+/// DBT_MODE — Diff (git change set) or All (every tracked file).
+type Mode =
+    | Diff
+    | All
+
+/// A git ref range (types.fsx Range). Empty strings mean "unset" —
+/// weir records have no Option-of-everything default, so the port uses
+/// "" as the absent sentinel and converts at the boundary.
+type Range = {
+    fromRef: Option<string>
+    toRef: Option<string>
+}
+
+/// The change-set actually resolved by a diff (types.fsx ChangeSetRange).
+type ChangeSetRange = {
+    baseCommits: seq<string>
+    currentCommit: string
+}
+
+/// One discovered project (types.fsx ProjectMetadata). Function-free so
+/// it compares, shows, and serialises (the weir data-field law).
+type ProjectMetadata = {
+    fileName: string
+    fileNameNoExtension: string
+    fullPath: string
+    fullDir: string
+    dir: string
+    dirSlug: string
+    relativePath: string
+    relativeDir: string
+    projectId: string
+    kind: string
+}
+
+/// The context a leaf-expansion function sees (types.fsx
+/// LeafExpansionContext). `filesByDir` is dbt's `Map<dir, files>`.
+type LeafContext = {
+    projectPath: string
+    filesByDir: Map<string, seq<string>>
+}
+
+/// A selector (types.fsx Selector). weir records CAN carry function
+/// fields (isRequired/isIgnored/projectId/expandLeafs), so this ports
+/// almost 1:1 — the CE DSL is what does NOT (see lib/plan.weir + FINDINGS).
+/// A function-bearing record cannot be `show`n/serialised/compared, so
+/// ProjectMetadata (data) and Selector (behaviour) stay separate types.
+type Selector = {
+    id: string
+    patterns: seq<string>
+    excludePatterns: seq<string>
+    discoveryRoot: Option<string>
+    isRequired: string -> bool
+    isIgnored: string -> bool
+    projectId: ProjectMetadata -> string
+    expandLeafs: LeafContext -> seq<string>
+}
+
+/// A profile (types.fsx Profile). `changeKeyRegex` is the single-group
+/// raw pattern used to scrape commit messages; None disables it.
+type Profile = {
+    id: string
+    includeRootDir: bool
+    changeKeyRegex: Option<string>
+    selector: Selector
+}
+
+/// The whole build plan (types.fsx Plan): profiles keyed by id + an
+/// optional range. `plan` would be the F# name; `BuildPlan` sidesteps
+/// weir's keyword.
+type BuildPlan = {
+    profiles: Map<string, Profile>
+    range: Option<Range>
+}
+
+/// The evaluate result (types.fsx PlanOutput). Data-only so a test can
+/// `to json` it and diff — the snapshot idea, for free.
+type PlanOutput = {
+    requiredProjects: seq<ProjectMetadata>
+    changeKeys: Option<seq<string>>
+    changeSetRange: Option<ChangeSetRange>
+    changedDirs: Option<Map<string, seq<string>>>
+}
+
+/// The diff result (types.fsx DiffResult).
+type DiffResult = {
+    effectiveRange: ChangeSetRange
+    dirs: Map<string, seq<string>>
+}

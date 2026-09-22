@@ -1,0 +1,225 @@
+module CiGithub
+
+// GitHub CI integrations, ported from fsx/ci/github/{last-success-sha,
+// deploy-spec,output}.fsx.
+//
+// THREE surfaces, in ascending oracle-reachability:
+//  1. last-success-sha — resolves a base commit from the GitHub Actions
+//     API (the last workflow run whose every job/step succeeded/skipped).
+//     The API is unreachable here (no token, no network), so the port
+//     drives the PURE `logic` over in-memory run/job data (oracle'd
+//     structurally, exactly as dbt's `internal logic` is unit-testable)
+//     and SHAPES the Http calls (typed request + from json), which
+//     `weir check` proves resolve. FINDINGS states API-live vs structural.
+//  2. deploy-spec — pure PlanOutput -> UpdateSpec from typed env. Fully
+//     oracle-comparable (env in, JSON out).
+//  3. output — append `key=value` to $GITHUB_OUTPUT. Deterministic file IO.
+
+import "./types.weir" as T
+import "./cispec.weir" as Spec
+
+// ---- API response shapes (last-success-sha.fsx) ----
+
+/// A workflow run's conclusion step (Step.conclusion). Option: a step may
+/// be in-progress (null conclusion).
+type Step = {
+    conclusion: Option<string>
+}
+
+/// A run's job (Job.steps).
+type Job = {
+    steps: seq<Step>
+}
+
+/// A workflow run (WorkflowRun). `id` selects the jobs endpoint;
+/// `head_sha` is the commit we want.
+type WorkflowRun = {
+    id: int
+    head_sha: string
+}
+
+/// The runs-list response (`{| workflow_runs |}`).
+type RunsResponse = {
+    workflow_runs: seq<WorkflowRun>
+}
+
+/// The jobs-list response (`{| jobs |}`).
+type JobsResponse = {
+    jobs: seq<Job>
+}
+
+/// The discovery outcome (WorkflowRunDiscovery). `toOption` collapses to
+/// the successful commit or None.
+type RunDiscovery =
+    | HeadSha of string
+    | NoneSuccessful
+    | NoneFound
+    | Skipped
+
+/// The discovery result as an Option commit (WorkflowRunDiscovery.toOption).
+let toOption : RunDiscovery -> Option<string>
+
+let toOption d =
+    match d with
+    | HeadSha commit -> Some commit
+    | NoneSuccessful -> None
+    | NoneFound -> None
+    | Skipped -> None
+
+/// A step is green if it succeeded or was skipped (last-success-sha.fsx's
+/// step predicate).
+let stepGreen : Step -> bool
+
+let stepGreen step =
+    match step.conclusion with
+    | Some "success" -> true
+    | Some "skipped" -> true
+    | Some _ -> false
+    | None -> false
+
+/// A job is green if it has steps and all are green (empty steps = false).
+let jobGreen : Job -> bool
+
+let jobGreen job =
+    match job.steps with
+    | [] -> false
+    | steps -> steps |> Seq.forall stepGreen
+
+/// The PURE selection logic (last-success-sha.fsx `internal logic`): given
+/// the runs and a jobs-by-run lookup, pick the highest-id run all of whose
+/// jobs are green, and return its head_sha. This is the oracle'd core —
+/// it takes data, not the network, so a fixture drives it identically to
+/// dbt's unit-testable `logic`.
+let pickSuccessful : seq<WorkflowRun> -> (int -> seq<Job>) -> RunDiscovery
+
+let pickSuccessful runs jobsOf =
+    match runs with
+    | [] -> NoneFound
+    | rs ->
+        let winner =
+            rs
+            |> Seq.sortByDescending (fun r -> r.id)
+            |> Seq.tryFind (fun r ->
+                let jobs = jobsOf r.id
+                match jobs with
+                | [] -> false
+                | js -> js |> Seq.forall jobGreen)
+        match winner with
+        | Some r -> HeadSha r.head_sha
+        | None -> NoneSuccessful
+
+// ---- the live Http shaping (structurally checked, not run here) ----
+
+/// GitHub CI context (last-success-sha.fsx first readEnv).
+type GithubContext = {
+    GITHUB_ACTIONS: Option<bool>
+}
+
+/// The full GitHub env needed to hit the API (last-success-sha.fsx env).
+type GithubApiEnv = {
+    GITHUB_REPOSITORY: string
+    GITHUB_TOKEN: Secret
+    GITHUB_REF_NAME: string
+    GITHUB_WORKFLOW_REF: string
+}
+
+/// The workflow id is the last path segment of the ref before any '@'
+/// (last-success-sha.fsx: `WORKFLOW_REF.Split "@" |> head |> Split "/" |> last`).
+let workflowIdOf : string -> string
+
+let workflowIdOf workflowRef =
+    let beforeAt =
+        match Str.trySplitOnce "@" workflowRef with
+        | Some (before, _) -> before
+        | None -> workflowRef
+    beforeAt |> Str.split "/" |> Seq.last
+
+/// Fetch the recent successful runs for a branch (last-success-sha.fsx
+/// workflowRuns). The request shape is what `weir check` proves; a live
+/// run needs a token + network (see FINDINGS oracle status).
+let fetchRuns : GithubApiEnv -> seq<WorkflowRun>
+
+let fetchRuns env =
+    let workflowId = workflowIdOf env.GITHUB_WORKFLOW_REF
+    let url =
+        $"https://api.github.com/repos/{env.GITHUB_REPOSITORY}/actions/workflows/{workflowId}/runs?status=success&branch={env.GITHUB_REF_NAME}&page=1&per_page=10"
+    let resp =
+        Http.send {
+            Http.get url with
+            secretHeaders = [("Authorization", Secret.map (fun t -> $"token {t}") env.GITHUB_TOKEN)]
+            headers = [("Accept", "application/vnd.github+json")]
+        }
+    if resp.status >= 400 then fail $"GitHub runs API returned {resp.status}"
+    resp.body |> from json RunsResponse |> _.workflow_runs
+
+/// Fetch a run's jobs (last-success-sha.fsx workflowRunJobs).
+let fetchJobs : GithubApiEnv -> int -> seq<Job>
+
+let fetchJobs env runId =
+    let url = $"https://api.github.com/repos/{env.GITHUB_REPOSITORY}/actions/runs/{runId}/jobs"
+    let resp =
+        Http.send {
+            Http.get url with
+            secretHeaders = [("Authorization", Secret.map (fun t -> $"token {t}") env.GITHUB_TOKEN)]
+            headers = [("Accept", "application/vnd.github+json")]
+        }
+    if resp.status >= 400 then fail $"GitHub jobs API returned {resp.status}"
+    resp.body |> from json JobsResponse |> _.jobs
+
+/// The full resolve (last-success-sha.fsx getLastSuccessCommitHash):
+/// Skipped when not in Actions; else fetch runs, run the pure logic with
+/// the live jobs lookup.
+let getLastSuccessCommitHash : GithubContext -> GithubApiEnv -> RunDiscovery
+
+let getLastSuccessCommitHash context env =
+    if context.GITHUB_ACTIONS |> Option.defaultValue false |> not then
+        Skipped
+    else
+        let runs = fetchRuns env
+        pickSuccessful runs (fetchJobs env)
+
+// ---- deploy-spec (deploy-spec.fsx) ----
+
+/// The build env for the deploy-spec (deploy-spec.fsx BuildEnv). dbt uses
+/// [<Env.Default>] on every field; weir Env.load takes string/int
+/// defaults directly. GITHUB_RUN_ID is int (dbt's int64 — see FINDINGS).
+type BuildEnv = {
+    [<Default "invalid">]
+    GITHUB_REPOSITORY: string
+    [<Default "development">]
+    GITHUB_REF_NAME: string
+    [<Default "00000000">]
+    GITHUB_SHA: string
+    [<Default 1>]
+    GITHUB_RUN_ID: int
+}
+
+/// Build the UpdateSpec for a plan output (deploy-spec.fsx deploymentSpec):
+/// new_tag is the 7-char short SHA.
+let deploymentSpec : BuildEnv -> PlanOutput -> UpdateSpec
+
+let deploymentSpec env output =
+    Spec.UpdateSpec {
+        source_repo = env.GITHUB_REPOSITORY
+        source_branch = env.GITHUB_REF_NAME
+        new_tag = env.GITHUB_SHA[0..6]
+        version = env.GITHUB_RUN_ID
+        change_keys = output.changeKeys
+        images = Spec.imagesOf output
+    }
+
+// ---- output (output.fsx) ----
+
+/// The output env (output.fsx GithubEnv): where to append key=value.
+type GithubOutputEnv = {
+    [<Default "vars.env">]
+    GITHUB_OUTPUT: string
+}
+
+/// Append a key=value line to $GITHUB_OUTPUT (output.fsx
+/// appendToGithubOutput). Refuses a key containing '='.
+let appendOutput : GithubOutputEnv -> string -> string -> unit
+
+let appendOutput env key value =
+    if key |> Str.contains "=" then fail "Key cannot contain '='"
+    [$"{key}={value}"] |> File.append env.GITHUB_OUTPUT

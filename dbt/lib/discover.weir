@@ -1,0 +1,124 @@
+module Discover
+
+// The discovery pipeline, ported from fsx/plan.fsx findParentProjectPath
+// + findRequiredProjects. dbt uses Microsoft.Extensions.FileSystemGlobbing
+// Matcher; weir has Path.glob (within-segment *, cross-segment **) but no
+// exclude-pattern combinator, so excludes are hand-rolled substring
+// contains (matching dbt's relative-path AddExcludePatterns intent).
+
+import "./types.weir" as T
+
+/// Does a project file match the include patterns? Patterns are file
+/// globs like "*.*sproj" applied to files DIRECTLY in `dir`
+/// (Matcher.GetResultsInFullPath is non-recursive per directory).
+let matchesIn : seq<string> -> string -> seq<string>
+
+let matchesIn patterns dir =
+    patterns
+    |> Seq.collect (fun pat -> Path.glob $"{dir}/{pat}")
+    |> Seq.distinct
+    |> Seq.freeze
+
+/// A path is excluded if any exclude pattern is a substring of it
+/// (dbt's excludePatterns are relative-path fragments — plan.fsx builds
+/// `**/*.*` + AddExcludePatterns; the effective test is containment).
+let isExcluded : seq<string> -> string -> bool
+
+let isExcluded excludes path =
+    excludes |> Seq.exists (fun e -> path |> Str.contains e)
+
+/// The ancestor chain of a dir up to (and including) rootDir, nearest
+/// first. Uses Graph.reach with each dir's single neighbour = its parent;
+/// the walk stops at rootDir. dbt's findParentProj recurses on
+/// Directory.GetParent and halts at rootDir (unless includeRootDir).
+let ancestors : string -> string -> bool -> seq<string>
+
+let ancestors rootDir startDir includeRoot =
+    let parentOf d =
+        if d == rootDir then []
+        else
+            let p = Path.dir d
+            if p == "" then []
+            elif not includeRoot && p == rootDir then []
+            else [p]
+    // Graph.reach is breadth-first from start; a linear chain stays ordered.
+    let chain = Graph.reach (fun d -> d) parentOf startDir
+    if includeRoot then chain
+    else chain |> Seq.where (fun d -> d <> rootDir)
+
+/// Find the nearest ancestor dir of `startDir` containing matching,
+/// non-excluded project files; return those files (full paths).
+/// dbt returns the matches of the FIRST ancestor that has any.
+let findParentProjects : string -> seq<string> -> seq<string> -> bool -> string -> seq<string>
+
+let findParentProjects rootDir patterns excludes includeRoot startDir =
+    let hitsIn d =
+        matchesIn patterns d
+        |> Seq.where (fun f -> not (isExcluded excludes f))
+        |> Seq.freeze
+    let picked =
+        ancestors rootDir startDir includeRoot
+        |> Seq.tryPick (fun d ->
+            let hits = hitsIn d
+            if hits |> Seq.isEmpty then None else Some hits)
+    picked |> Option.defaultValue []
+
+/// Build ProjectMetadata for a discovered (relative) project path
+/// (plan.fsx's final Seq.map). Paths are repo-relative, so relativePath
+/// == the path itself and every field derives lexically — no cwd touch.
+/// projectId default: relativeDir lowercased, spaces->'-', split on
+/// '.'/'_' and rejoined with '-', then run through selector.projectId.
+let metadataOf : Selector -> string -> ProjectMetadata
+
+let metadataOf selector path =
+    let fileName = Path.fileName path
+    let relativeDir = Path.dir path
+    let dirName = Path.fileName relativeDir
+    let defaultId =
+        relativeDir
+        |> Str.toLower
+        |> Str.replace " " "-"
+        |> Str.rsplit @"[._]"
+        |> Str.join "-"
+    let baseMeta = ProjectMetadata {
+        fileName = fileName
+        fileNameNoExtension = Path.stem path
+        fullPath = path
+        fullDir = relativeDir
+        dir = dirName
+        dirSlug = dirName |> Str.toLower |> Str.replace "." "-"
+        relativePath = path
+        relativeDir = relativeDir
+        projectId = defaultId
+        kind = selector.id
+    }
+    { baseMeta with projectId = selector.projectId baseMeta }
+
+/// The full discovery pipeline (plan.fsx findRequiredProjects):
+/// changed dirs -> walk up to project files -> expand leafs -> drop
+/// excluded/ignored -> warn+drop not-required -> build metadata ->
+/// sort by projectId.
+let findRequiredProjects : Map<string, seq<string>> -> bool -> Selector -> seq<ProjectMetadata>
+
+let findRequiredProjects filesByDir includeRoot selector =
+    let rootDir = "."
+    let discovered =
+        filesByDir
+        |> Map.keys
+        |> Seq.collect (findParentProjects rootDir selector.patterns selector.excludePatterns includeRoot)
+        |> Seq.distinct
+        |> Seq.collect (fun projectPath ->
+            selector.expandLeafs (LeafContext { projectPath = projectPath; filesByDir = filesByDir }))
+        |> Seq.where (fun p -> not (isExcluded selector.excludePatterns p))
+        |> Seq.distinct
+        |> Seq.where (fun p -> not (selector.isIgnored p))
+        |> Seq.freeze
+    // warn on leaf projects not matching the required criterion (plan.fsx)
+    discovered
+    |> Seq.where (fun p -> not (selector.isRequired p))
+    |> Seq.iter (fun p ->
+        printerr $"WARNING: {p} is a leaf project not matching the inclusion criteria. The project will be ignored.")
+    discovered
+    |> Seq.where selector.isRequired
+    |> Seq.map (metadataOf selector)
+    |> Seq.sortBy (fun p -> p.projectId)

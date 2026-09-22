@@ -1,0 +1,125 @@
+module Bicep
+
+// The bicep selector, ported from fsx/bicep/project.fsx.
+//
+// dbt's bicep selector: patterns *.bicep + *.bicepparam; required_when =
+// the file is a *.bicepparam (only param files are deployable leaves);
+// expand_leafs walks a dependency tree built from bicep `module`/`using`/
+// `import` references, returning the LEAF (.bicepparam) dependants of a
+// changed .bicep module.
+//
+// PORT NOTES:
+//  - Include side is PURE GLOB — *.bicep/*.bicepparam on Path.glob today
+//    (no excludes; FINDINGS (d) "works on Path.glob today").
+//  - Import parsing: dbt uses three compiled Regexes over each line;
+//    weir uses Str.rmatchAll with the same raw patterns (deterministic,
+//    no hand-rolled parser). A .bicepparam reads `using`/`import`; a
+//    .bicep reads `module`/`import`.
+//  - The dependency-tree leaf walk is dbt's hand-written `walk` with a
+//    visited Set — weir's Graph.reach IS that walk (visited-set built in,
+//    cycle-safe), the same win the dotnet/asdf/ring ports found. The
+//    graph maps a referenced file -> the files that reference it, so
+//    reaching from a changed .bicep yields every transitive dependant;
+//    keep the ones the selector calls required (the .bicepparam leaves).
+
+import "./types.weir" as T
+
+/// A bicep file is required iff it is a deployable leaf: a .bicepparam
+/// (project.fsx required_when: Path.GetExtension f = ".bicepparam").
+let isRequired : string -> bool
+
+let isRequired f =
+    Path.extension f == ".bicepparam"
+
+/// The import/reference patterns for a bicep file, keyed by extension
+/// (project.fsx: .bicepparam reads using+import; .bicep reads module+import).
+/// Each pattern has ONE capturing group: the referenced .bicep path.
+let refPatterns : string -> seq<string>
+
+let refPatterns filePath =
+    match Path.extension filePath with
+    | ".bicepparam" -> [@"using\s+'([^']+\.bicep)'"; @"from\s+'([^']+\.bicep)'"]
+    | _ -> [@"module\s+\w+\s+'([^']+\.bicep)'"; @"from\s+'([^']+\.bicep)'"]
+
+/// Parse a bicep file's outgoing references to other bicep files, as
+/// normalised paths relative to the repo root (project.fsx parseImports —
+/// dbt resolves against the file's dir and GetFullPath; the port keeps
+/// paths repo-relative via Path.combine + Path.normalize, since discovery
+/// runs at the repo root and git yields relative paths).
+let parseImports : string -> seq<string>
+
+let parseImports filePath =
+    let dir = Path.dir filePath
+    let patterns = refPatterns filePath
+    File.read filePath
+    |> Seq.collect (fun line ->
+        patterns
+        |> Seq.collect (fun pat ->
+            Str.rmatchAll pat line
+            |> Seq.map (fun groups -> groups |> Seq.head)
+            |> Seq.map (fun rel -> Path.combine dir rel |> Path.normalize)))
+    |> Seq.freeze
+
+/// Build the reverse dependency graph over all bicep files under the
+/// discovery root: referenced-file -> the files that reference it
+/// (project.fsx makeDependencyTree, which groups (dep, referrer) by dep).
+/// So reaching FROM a changed module finds every file downstream of it.
+let makeDependencyTree : string -> Map<string, seq<string>>
+
+let makeDependencyTree rootDir =
+    let files =
+        Path.glob $"{rootDir}/**/*.bicep"
+        |> Seq.append (Path.glob $"{rootDir}/**/*.bicepparam")
+        |> Seq.map Path.normalize
+        |> Seq.freeze
+    files
+    |> Seq.collect (fun f -> parseImports f |> Seq.map (fun dep -> (dep, f)))
+    |> Seq.groupBy (fun (dep, _) -> dep)
+    |> Seq.map (fun (dep, pairs) -> (dep, pairs |> Seq.map (fun (_, referrer) -> referrer) |> Seq.freeze))
+    |> Map.ofPairs
+
+/// The leaf (.bicepparam) dependants reachable from a changed file
+/// (project.fsx findLeafDependants: walk the tree, yield the file itself
+/// when it is a leaf, recurse into its dependants). Graph.reach replaces
+/// dbt's hand-written visited-Set walk; the result keeps only the
+/// required (leaf) files.
+let findLeafDependants : Map<string, seq<string>> -> string -> seq<string>
+
+let findLeafDependants tree changedFile =
+    let neighbors f = Map.tryGet f tree |> Option.defaultValue []
+    Graph.reach (fun f -> f) neighbors changedFile
+    |> Seq.where isRequired
+
+/// Leaf expansion for the bicep selector (project.fsx expand_leafs):
+/// from the changed bicep/bicepparam files, walk the dependency tree to
+/// every leaf (.bicepparam) dependant, distinct.
+let expandLeafs : LeafContext -> seq<string>
+
+let expandLeafs ctx =
+    let tree = makeDependencyTree "."
+    ctx.filesByDir
+    |> Map.values
+    |> Seq.collect (fun fs -> fs)
+    |> Seq.where (fun f ->
+        let ext = Path.extension f
+        ext == ".bicep" || ext == ".bicepparam")
+    |> Seq.map Path.normalize
+    |> Seq.collect (findLeafDependants tree)
+    |> Seq.distinct
+
+/// The generic bicep selector (project.fsx BicepSelectors.generic).
+/// Include-only globs, required = is-.bicepparam, leaf expansion walks
+/// the dependency tree from each changed bicep file.
+let generic : Selector
+
+let generic =
+    T.Selector {
+        id = "bicep"
+        patterns = ["*.bicep"; "*.bicepparam"]
+        excludePatterns = []
+        discoveryRoot = None
+        isRequired = isRequired
+        isIgnored = fun _ -> false
+        projectId = fun p -> p.projectId
+        expandLeafs = expandLeafs
+    }

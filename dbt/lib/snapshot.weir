@@ -1,0 +1,201 @@
+module Snapshot
+
+// Snapshot write/validate, ported from fsx/snapshot.fsx.
+//
+// PlanOutput is function-free by design (types.weir), so it is
+// `to json`-able — the thin Stage-2 add the Stage-1 stub named. dbt
+// projects PlanOutput into a stable SnapshotRecord (sorted projects by
+// relativePath, sorted dirs, sorted base commits — order-independence),
+// writes it pretty, and on Validate re-reads and compares.
+//
+// PORT NOTES:
+//  - SnapshotProject drops the fileNameNoExtension/fullPath/fullDir fields
+//    dbt's snapshot also drops (it keeps projectId/kind/fileName/
+//    relativePath/relativeDir/dir/dirSlug) — the snapshot is the STABLE
+//    subset, not the whole metadata.
+//  - The comparison (FINDINGS (c)#7: `==` undefined for Option<seq<_>> /
+//    seqs) is done by CANONICAL JSON string equality: both sides go
+//    through `to json` (fields in declaration order, seqs pre-sorted), so
+//    equal snapshots produce byte-identical JSON. This sidesteps the
+//    seq-equality gap deterministically — the snapshot is text on disk
+//    anyway, so text equality IS the contract.
+//  - ChangeSetRange carries seqs; to keep the record serialisable and
+//    comparable we sort baseCommits (dbt: `r.baseCommits |> List.sort`).
+
+import "./types.weir" as T
+
+/// The stable per-project subset dbt snapshots (snapshot.fsx
+/// SnapshotProject).
+type SnapshotProject = {
+    projectId: string
+    kind: string
+    fileName: string
+    relativePath: string
+    relativeDir: string
+    dir: string
+    dirSlug: string
+}
+
+/// A change-set range with baseCommits sorted (snapshot.fsx sorts them so
+/// the snapshot is order-independent).
+type SnapshotRange = {
+    baseCommits: seq<string>
+    currentCommit: string
+}
+
+/// The whole snapshot record (snapshot.fsx SnapshotRecord). Option range
+/// omits when None (to json drops a None field); changedDirs default to
+/// empty; requiredProjects sorted by relativePath.
+type SnapshotRecord = {
+    changeSetRange: Option<SnapshotRange>
+    changedDirs: Map<string, seq<string>>
+    requiredProjects: seq<SnapshotProject>
+}
+
+/// DBT_SNAPSHOT mode (snapshot.fsx SnapshotMode).
+type SnapshotMode =
+    | Write
+    | Validate
+
+/// The snapshot env (a subset of DbtEnv + DBT_SNAPSHOT). Absent
+/// DBT_SNAPSHOT means "do nothing" (dbt: `| None -> ()`).
+type SnapshotEnv = {
+    DBT_SNAPSHOT: Option<SnapshotMode>
+    [<Default "default">]
+    DBT_PROFILE: string
+    DBT_SNAPSHOT_DIR: Option<string>
+}
+
+/// Project a ProjectMetadata to its snapshot subset (snapshot.fsx
+/// toSnapshotProject).
+let toSnapshotProject : ProjectMetadata -> SnapshotProject
+
+let toSnapshotProject p =
+    SnapshotProject {
+        projectId = p.projectId
+        kind = p.kind
+        fileName = p.fileName
+        relativePath = p.relativePath
+        relativeDir = p.relativeDir
+        dir = p.dir
+        dirSlug = p.dirSlug
+    }
+
+/// Build the canonical SnapshotRecord from a PlanOutput (snapshot.fsx
+/// toRecord): sort base commits, sort each dir's files, sort projects by
+/// relativePath. Determinism here is what makes JSON equality a valid
+/// comparison.
+let toRecord : PlanOutput -> SnapshotRecord
+
+let sortRange r =
+    SnapshotRange {
+        baseCommits = r.baseCommits |> Seq.sort |> Seq.freeze
+        currentCommit = r.currentCommit
+    }
+
+let toRecord output =
+    let range = output.changeSetRange |> Option.map sortRange
+    let dirs =
+        match output.changedDirs with
+        | None -> Map.ofPairs []
+        | Some d ->
+            d
+            |> Map.pairs
+            |> Seq.map (fun (k, files) -> (k, files |> Seq.sort |> Seq.freeze))
+            |> Map.ofPairs
+    SnapshotRecord {
+        changeSetRange = range
+        changedDirs = dirs
+        requiredProjects =
+            output.requiredProjects
+            |> Seq.map toSnapshotProject
+            |> Seq.sortBy (fun p -> p.relativePath)
+            |> Seq.freeze
+    }
+
+/// The snapshot file base name (snapshot.fsx baseName): keyed by profile
+/// and the short base/current hashes, or "-all" when there is no range.
+let baseName : string -> PlanOutput -> string
+
+let baseName profile output =
+    match output.changeSetRange with
+    | Some r ->
+        let baseHash = r.baseCommits |> Seq.tryHead |> Option.defaultValue "0000000"
+        let baseShort = baseHash[0..6]
+        let curShort = r.currentCommit[0..6]
+        $".dbt-{profile}-{baseShort}-{curShort}"
+    | None -> $".dbt-{profile}-all"
+
+/// The snapshot file path (snapshot.fsx filePath).
+let filePath : string -> string -> PlanOutput -> string
+
+let filePath dir profile output =
+    Path.combine dir $"{baseName profile output}.snapshot.json"
+
+/// The miss file path (snapshot.fsx missFilePath).
+let missFilePath : string -> string -> PlanOutput -> string
+
+let missFilePath dir profile output =
+    Path.combine dir $"{baseName profile output}.snapshot-miss.json"
+
+/// Canonical JSON of a record (one document). The comparison currency —
+/// two snapshots are equal iff this text matches (fields render in
+/// declaration order; seqs are pre-sorted in toRecord).
+let canonicalJson : SnapshotRecord -> string
+
+let canonicalJson record =
+    record |> to json |> Seq.freeze |> Str.join "\n"
+
+/// Write a snapshot (snapshot.fsx `Some Write`): the canonical record's
+/// JSON to the profile/hash-named file. Returns the path written.
+let write : string -> string -> PlanOutput -> string
+
+let write dir profile output =
+    let record = toRecord output
+    let path = filePath dir profile output
+    [canonicalJson record] |> File.write path
+    path
+
+/// Validate a snapshot (snapshot.fsx `Some Validate`): read the saved
+/// snapshot, compare canonical JSON to the current output. On mismatch,
+/// write the current output to the miss file and return the miss path in
+/// an Error; on match return Ok the path. Missing file is a distinct Error.
+type ValidateResult =
+    | Match of string
+    | Mismatch of string
+    | Missing of string
+
+let validate : string -> string -> PlanOutput -> ValidateResult
+
+let validate dir profile output =
+    let path = filePath dir profile output
+    if not (File.exists path) then
+        Missing path
+    else
+        let saved = File.read path |> Str.join "\n"
+        let current = canonicalJson (toRecord output)
+        if saved == current then
+            Match path
+        else
+            let missPath = missFilePath dir profile output
+            [current] |> File.write missPath
+            Mismatch missPath
+
+/// The env-driven entry (snapshot.fsx apply): reads DBT_SNAPSHOT and
+/// dispatches. No-op when unset. Validate mismatch/missing exits 1
+/// (dbt's behaviour), Write logs the path.
+let apply : SnapshotEnv -> PlanOutput -> unit
+
+let apply env output =
+    let dir = env.DBT_SNAPSHOT_DIR |> Option.defaultValue "."
+    let profile = env.DBT_PROFILE
+    match env.DBT_SNAPSHOT with
+    | None -> ()
+    | Some Write ->
+        let path = write dir profile output
+        Log.info $"Snapshot written to: {path}"
+    | Some Validate ->
+        match validate dir profile output with
+        | Match path -> Log.info $"Snapshot matches current output: {path}"
+        | Missing path -> fail $"Snapshot file not found: {path}"
+        | Mismatch missPath -> fail $"Snapshot mismatch. Current output written to: {missPath}"

@@ -1,0 +1,124 @@
+module Plan
+
+// DbtEnv config + Plan.evaluate, ported from fsx/plan.fsx.
+//
+// THE NAME COLLISION: this module is `Plan` and its entry is
+// `Plan.evaluate` — dbt's build-plan evaluator. It has NOTHING to do
+// with weir's `plan` keyword (dry-run mutation capture). weir's `plan`
+// captures FS/HTTP mutations of a block into an inspectable value;
+// dbt's evaluate reads git + globs and RETURNS a report. Different
+// verbs entirely — the port keeps dbt's name at the module boundary,
+// where weir's keyword never appears.
+
+import "./types.weir" as T
+import "./gitdiff.weir" as GitDiff
+import "./discover.weir" as Discover
+
+/// The env-driven config (plan.fsx DbtEnv). weir's Env.load fills a
+/// typed record; `[<Default>]` supplies the resting point for an absent
+/// var, and Option fields read as None when unset. DBT_MODE is the
+/// Mode enum from types.weir (Env.load matches case-insensitively, so
+/// DBT_MODE=diff selects Diff).
+/// GAP (c): weir's Env.load enum fields REJECT [<Default>] (attribute
+/// literals are string/int/bool only), unlike dbt's
+/// `[<Env.Default("diff")>] DBT_MODE: Mode`. The weir resting point for
+/// an enum is Option<Mode> + Option.defaultValue, so DBT_MODE is
+/// Option here and defaults to Diff in `modeOf` below.
+type DbtEnv = {
+    DBT_MODE: Option<Mode>
+    [<Default "default">]
+    DBT_PROFILE: string
+    DBT_CURRENT_COMMIT: Option<string>
+    DBT_BASE_COMMIT: Option<string>
+    DBT_PR_TARGET_BRANCH: Option<string>
+}
+
+/// The DBT_MODE resting point (dbt's Env.Default "diff").
+let modeOf : DbtEnv -> Mode
+
+let modeOf env =
+    env.DBT_MODE |> Option.defaultValue T.Diff
+
+/// Resolve the base-commit strategy (plan.fsx baseCommitStrategy):
+/// a PR target branch -> MergeBase; else an explicit fromRef ->
+/// Override; else Parent.
+let baseStrategy : DbtEnv -> Option<string> -> BaseStrategy
+
+let baseStrategy env fromRef =
+    match env.DBT_PR_TARGET_BRANCH with
+    | Some branch -> T.MergeBase branch
+    | None ->
+        match fromRef with
+        | Some r -> T.Override r
+        | None -> T.Parent
+
+/// Evaluate a build plan (plan.fsx Plan.evaluate). Reads DbtEnv, picks
+/// the profile, computes changed dirs (Diff) or all dirs (All), runs
+/// discovery, and scrapes change keys. Returns a PlanOutput.
+///
+/// Note: the F# original `exit 0`s on an empty result set (outside
+/// INTERACTIVE) and runs postActions; the port returns the value and
+/// lets the caller (bin/dbt.weir) decide, keeping evaluate pure of exit.
+let evaluate : DbtEnv -> BuildPlan -> PlanOutput
+
+let evaluate env buildPlan =
+    let mode = modeOf env
+    let profileId = env.DBT_PROFILE
+    let profile =
+        match Map.tryGet profileId buildPlan.profiles with
+        | Some p -> p
+        | None -> fail $"Profile {profileId} not configured"
+
+    // range defaults to (DBT_BASE_COMMIT, DBT_CURRENT_COMMIT) when the
+    // plan carries none (plan.fsx range-fill).
+    let range =
+        match buildPlan.range with
+        | Some r -> r
+        | None -> Range { fromRef = env.DBT_BASE_COMMIT; toRef = env.DBT_CURRENT_COMMIT }
+
+    let includeRoot = profile.includeRootDir
+    let selector = profile.selector
+
+    let dirsAndRange =
+        match mode with
+        | Diff ->
+            let strat = baseStrategy env range.fromRef
+            let result = GitDiff.dirsFromDiff includeRoot strat range.toRef
+            let csr = ChangeSetRange {
+                baseCommits = result.effectiveRange.baseCommits
+                currentCommit = result.effectiveRange.currentCommit
+            }
+            (result.dirs, Some csr)
+        | All ->
+            (GitDiff.allDirs includeRoot, None)
+
+    let (dirs, diffRange) = dirsAndRange
+
+    let required =
+        Discover.findRequiredProjects dirs includeRoot selector |> Seq.freeze
+
+    let changeKeys =
+        match diffRange with
+        | None -> None
+        | Some r ->
+            match profile.changeKeyRegex with
+            | None -> None
+            | Some regex ->
+                let keys =
+                    r.baseCommits
+                    |> Seq.collect (fun b -> GitDiff.parseCommitKeys regex b r.currentCommit)
+                    |> Seq.distinct
+                    |> Seq.freeze
+                Some keys
+
+    let changedDirs =
+        match mode with
+        | Diff -> Some dirs
+        | All -> None
+
+    PlanOutput {
+        requiredProjects = required
+        changeKeys = changeKeys
+        changeSetRange = diffRange
+        changedDirs = changedDirs
+    }

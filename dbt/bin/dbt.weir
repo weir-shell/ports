@@ -1,0 +1,55 @@
+#!/usr/bin/env weir
+
+// dbt CLI entry — the DEFAULT dotnet plan, evaluated.
+//
+// THE CE-DSL REPLACEMENT: dbt authors a plan with computation-expression
+// builders (plan.builder.fsx):
+//
+//     plan {
+//         profile {
+//             selector { id "dotnet"; pattern "*.*sproj"
+//                        ignored_when DotnetProject.isTest }
+//         }
+//     } |> Plan.evaluate
+//
+// weir has NO computation expressions, so the same config is a plain
+// nested record. The builder's sugar (extend/merge, facet lists, reverse
+// order) is gone; what remains is an ordinary value — see FINDINGS (b).
+
+import "./../lib/types.weir" as T
+import "./../lib/plan.weir" as Dbt
+import "./../lib/dotnet.weir" as Dotnet
+
+// The dotnet profile: the generic dotnet selector, scraping change keys.
+let profile = T.Profile {
+    id = "default"
+    includeRootDir = false
+    changeKeyRegex = Some @"(CHANGE-KEY-[a-z0-9]+)"
+    selector = Dotnet.generic
+}
+
+let buildPlan = T.BuildPlan {
+    profiles = Map.ofPairs [("default", profile)]
+    range = None
+}
+
+let env = Env.load DbtEnv
+let out = Dbt.evaluate env buildPlan
+
+// Report (plan.fsx Plan.summary + the snapshot fields).
+print "=== REQUIRED PROJECTS ==="
+out.requiredProjects
+|> Seq.iter (fun p -> print $"PROJECT\t{p.projectId}\t{p.kind}\t{p.relativePath}\t{p.dirSlug}")
+
+print "=== CHANGE KEYS ==="
+match out.changeKeys with
+| Some ks -> ks |> Seq.sort |> Seq.iter (fun k -> print $"KEY\t{k}")
+| None -> print "KEY\t(none)"
+
+print "=== CHANGED DIRS ==="
+match out.changedDirs with
+| Some d -> d |> Map.keys |> Seq.iter (fun k -> print $"DIR\t{k}")
+| None -> print "DIR\t(none)"
+
+if out.requiredProjects |> Seq.isEmpty then
+    printerr "No project changes."

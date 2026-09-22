@@ -1,0 +1,44 @@
+module Stubs
+
+// STUB-WITH-TEACH — the dbt surface deliberately NOT ported in Stage 1
+// (the ring precedent). Each stub is inert: it names its dbt origin and
+// fails loudly if wired in, so the boundary is explicit, not silent.
+//
+// NOT PORTED IN STAGE 1:
+//   - bicep selector       (fsx/bicep/*)      : pattern "*.bicep"/"*.bicepparam"
+//   - kustomize selector   (fsx/kustomize/*)  : kustomization discovery
+//   - node selector        (fsx/node/*)       : package.json discovery
+//   - dotnet dependency graph leaf expansion  (fsx/dotnet/solution.fsx):
+//       makeDependencyTree / findLeafDependants — needs .sln/.slnx parsing
+//       + ProjectReference graph walk; Stage-1 expandLeafs is identity.
+//   - CI last-success-sha  (fsx/ci/github, fsx/ci/tekton): resolves a base
+//       commit from a CI provider's last green build.
+//   - deploy-spec / output (fsx/ci/*)         : BuildSpec/UpdateSpec emit.
+//   - snapshot write/validate (fsx/snapshot.fsx): PlanOutput is already
+//       serialisable via `to json`, so snapshotting is a thin Stage-2 add.
+
+import "./types.weir" as T
+
+/// A selector that is declared but not ported — every probe fails with
+/// its origin. Kept as a value so a plan referencing it type-checks and
+/// the failure is a runtime boundary, not a silent no-op.
+let notPorted : string -> Selector
+
+let notPorted name =
+    Selector {
+        id = name
+        patterns = []
+        excludePatterns = []
+        discoveryRoot = None
+        isRequired = fun _ -> fail $"selector '{name}' is not ported in Stage 1"
+        isIgnored = fun _ -> false
+        projectId = fun p -> p.projectId
+        expandLeafs = fun ctx -> [ctx.projectPath]
+    }
+
+/// fsx/snapshot.fsx — inert. dbt writes/validates a snapshot JSON of the
+/// PlanOutput. PlanOutput is already serialisable, so this is Stage 2.
+let snapshot : PlanOutput -> unit
+
+let snapshot _ =
+    Log.info "snapshot: not ported in Stage 1 (PlanOutput is `to json`-able — a thin Stage-2 add)"

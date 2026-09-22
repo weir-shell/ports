@@ -1,0 +1,87 @@
+#!/usr/bin/env weir
+
+// Stage-2 harness (Tekton): the Tekton CI integration, in its own file
+// because ci_github and ci_tekton both declare RunDiscovery/BuildEnv and
+// weir cannot yet distinguish cross-module same-name types in one import
+// set (a real Stage-2 gap — see FINDINGS). In real use a plan imports one
+// provider, never both, so the split is faithful, not a workaround.
+//
+// Tests: the PURE last-success logic (oracle'd structurally), the filter
+// shaping, and the deploy-spec JSON shaping.
+
+import "./../lib/types.weir" as T
+import "./../lib/cispec.weir" as Spec
+import "./../lib/ci_tekton.weir" as Tek
+
+let assert cond msg =
+    if not cond then fail $"ASSERT FAILED: {msg}"
+    else print $"ok: {msg}"
+
+let out = T.PlanOutput {
+    requiredProjects = [
+        T.ProjectMetadata {
+            fileName = "A.csproj"; fileNameNoExtension = "A"; fullPath = "sln/A/A.csproj"
+            fullDir = "sln/A"; dir = "A"; dirSlug = "a"; relativePath = "sln/A/A.csproj"
+            relativeDir = "sln/A"; projectId = "sln-a"; kind = "slnx"
+        }
+    ]
+    changeKeys = Some ["CHANGE-KEY-x"]
+    changeSetRange = None
+    changedDirs = None
+}
+
+// ---------- CI: tekton pure logic ----------
+print "== CI TEKTON LOGIC =="
+let mkResult name endT commit =
+    Tek.TektonResult {
+        name = name
+        update_time = "2026-01-01T00:00:00Z"
+        annotations = Map.ofPairs []
+        summary = Tek.Summary {
+            kind = "PIPELINE_RUN"
+            status = Some "SUCCESS"
+            end_time = Some endT
+            annotations = Map.ofPairs [("commit", commit)]
+        }
+    }
+let tekResults = Some [
+    mkResult "r1" "2026-01-01T10:00:00Z" "tek-old"
+    mkResult "r2" "2026-01-02T10:00:00Z" "tek-new"
+]
+let tekPicked = Tek.pickSuccessful tekResults
+let tekSha = match tekPicked with | HeadSha s -> s | _ -> "none"
+assert (tekSha == "tek-new") "tekton: pickSuccessful picks the most-recent result by end_time"
+let tekNone = Tek.pickSuccessful None
+let tekIsNoneFound = match tekNone with | NoneFound -> true | _ -> false
+assert tekIsNoneFound "tekton: no results => NoneFound"
+
+// filterOf shaping
+let tekApiEnv = Tek.TektonApiEnv {
+    TEKTON_RESULTS_HOST = "results.example.com"
+    TEKTON_RESULTS_HOST_INSECURE = false
+    RESULTS_PARENT = "default"
+    PIPELINE_NAME = "build"
+    DBT_SOURCE_BRANCH = "main"
+    DEBUG = None
+}
+let filt = Tek.filterOf tekApiEnv
+assert (filt |> Str.contains "summary.status==SUCCESS") "tekton: filter includes the success clause"
+assert (filt |> Str.contains "annotations['branch']=='main'") "tekton: filter includes the branch clause"
+
+// ---------- CI: tekton deploy-spec ----------
+print "== CI TEKTON DEPLOY-SPEC =="
+let tekEnv = Tek.BuildEnv {
+    DBT_SOURCE_REPO = "acme/app"
+    DBT_SOURCE_BRANCH = "main"
+    DBT_REVISION = "0123456789ab"
+    DBT_RUN_VERSION = 7
+}
+let tekSpec = Tek.deploymentSpec tekEnv out
+assert (tekSpec.new_tag == "0123456") "tekton: new_tag is the short revision"
+assert (tekSpec.version == 7) "tekton: version from DBT_RUN_VERSION"
+let tekImages = tekSpec.images |> Seq.map (fun i -> i.name) |> Seq.freeze
+assert (Seq.equal tekImages ["sln-a"]) "tekton: one image per required project"
+let tekJson = tekSpec |> to json |> Seq.freeze |> Str.join "\n"
+assert (tekJson |> Str.contains "\"new_tag\":\"0123456\"") "tekton: deploy-spec serialises to JSON"
+
+print "STAGE-2 TEKTON ALL GREEN"

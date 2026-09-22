@@ -1,0 +1,69 @@
+module Selector
+
+// Selector.extend — the plain-record replacement for dbt's CE `extend`
+// (plan.builder.fsx flattenSelector/makeSelector). dbt's builder let a
+// selector inherit a base and APPEND patterns/excludes:
+//
+//     selector { extend baseSelector; pattern "*.toml" }
+//
+// weir has no computation expressions, so this is a plain merge FUNCTION
+// (FINDINGS (d)): take a base selector and an OverrideSpec of the fields
+// a caller usually tweaks, and return a new selector. Patterns and
+// excludes APPEND to the base's (dbt's list-accumulation), the rest
+// override when present. This restores the terseness without any facet
+// machinery — a caller writes the deltas, not a whole record.
+//
+// The "excludes merge in reverse order" CE artifact (test-plan.fsx) does
+// NOT arise here — append is append, in declaration order.
+
+import "./types.weir" as T
+
+/// The subset of a Selector a caller usually overrides. Every field is
+/// optional: absent = inherit the base. `addPatterns`/`addExcludes`
+/// APPEND to the base's lists (dbt's `pattern`/`exclude` accumulation);
+/// the function fields REPLACE when Some.
+type OverrideSpec = {
+    id: Option<string>
+    addPatterns: seq<string>
+    addExcludes: seq<string>
+    discoveryRoot: Option<string>
+    isRequired: Option<string -> bool>
+    isIgnored: Option<string -> bool>
+    projectId: Option<ProjectMetadata -> string>
+    expandLeafs: Option<LeafContext -> seq<string>>
+}
+
+/// An empty override — inherit everything. Callers copy-and-update this:
+/// `{ Selector.noOverrides with addPatterns = ["*.toml"] }`.
+let noOverrides : OverrideSpec
+
+let noOverrides =
+    OverrideSpec {
+        id = None
+        addPatterns = []
+        addExcludes = []
+        discoveryRoot = None
+        isRequired = None
+        isIgnored = None
+        projectId = None
+        expandLeafs = None
+    }
+
+/// Merge a base selector with an override spec (dbt's `extend`). Lists
+/// append; scalar/function overrides win when Some. A function field
+/// cannot compare or serialise (the weir data-field law), which is why
+/// OverrideSpec carries Option<fn> and this merges by match, not `with`
+/// on a shown record — the record itself is never shown.
+let extend : Selector -> OverrideSpec -> Selector
+
+let extend base spec =
+    T.Selector {
+        id = spec.id |> Option.defaultValue base.id
+        patterns = spec.addPatterns |> Seq.append base.patterns |> Seq.freeze
+        excludePatterns = spec.addExcludes |> Seq.append base.excludePatterns |> Seq.freeze
+        discoveryRoot = spec.discoveryRoot |> Option.orElse base.discoveryRoot
+        isRequired = spec.isRequired |> Option.defaultValue base.isRequired
+        isIgnored = spec.isIgnored |> Option.defaultValue base.isIgnored
+        projectId = spec.projectId |> Option.defaultValue base.projectId
+        expandLeafs = spec.expandLeafs |> Option.defaultValue base.expandLeafs
+    }
