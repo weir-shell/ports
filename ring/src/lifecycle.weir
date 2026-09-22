@@ -138,12 +138,10 @@ let stateOf ctx id =
     let f = stateFile ctx id
     if File.exists f then parseState (File.read f |> Seq.exactlyOne) else Zero
 
-/// left-pad-free column helper (weir has no Str.padRight)
+/// right-pad a column to width w
 let pad : int -> string -> string
 
-let pad w s =
-    let n = w - Str.length s
-    if n <= 0 then s else s + (Seq.replicate n " " |> Str.join "")
+let pad w s = Str.padRight w s
 
 let clock () =
     show (Instant.now ()) |> Str.splitOnce "T" |> snd

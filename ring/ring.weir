@@ -75,21 +75,6 @@ let readVerdict s id =
 
 // ---- proc runnable (Runnables/Proc/ProcRunnable.cs) ----
 
-let shq s = "'" + (s |> Str.replace "'" "'\\''") + "'"
-
-let shellLineFor p =
-    let argv =
-        p.args
-            |> Option.defaultValue []
-            |> Seq.append [p.command]
-            |> Seq.map shq
-            |> Str.join " "
-    let cdPrefix =
-        p.workingDir
-            |> Option.map (fun d -> $"cd {shq d} && ")
-            |> Option.defaultValue ""
-    $"{cdPrefix}exec {argv}"
-
 // ProcessRunnable.CheckHealthAsync: process-alive is the probe. ProcContext
 // has no ITrackRetries in ring, so a proc never escalates to Dead there;
 // --max-recoveries generalizes MaxTotalFailuresUntilDead to procs.
@@ -117,28 +102,30 @@ let tickProc s id child =
 
 let procGeneration s id p =
     Life.fire s.life id Life.Start
-    let line = shellLineFor p
-    within proc child = sh -c $line
-        within
-            Duration.sleep s.period
-            let budget = (s.deadline - Instant.now ()) + 60s
-            poll { Poll.defaults with timeout = budget; interval = s.period }
-                tickProc s id child
-            match Life.stateOf s.life id with
-            | Dead ->
-                writeVerdict s id "halt"
-            | _ ->
-                let died = not (Proc.running child)
-                if died then
-                    let code = Proc.wait child
-                    let last = Proc.tail child |> Seq.tryLast |> Option.defaultValue "<no output>"
-                    print $"           {Life.pad 12 id} exited (code {show code}), last output: {last}"
-                if died && Instant.now () < s.deadline then
-                    writeVerdict s id "recover"
-                else
+    let cmd = p.command
+    let argv = p.args |> Option.defaultValue []
+    within cd (p.workingDir |> Option.defaultValue ".")
+        within proc child = ^$cmd $@argv
+            within
+                Duration.sleep s.period
+                let budget = (s.deadline - Instant.now ()) + 60s
+                poll { Poll.defaults with timeout = budget; interval = s.period }
+                    tickProc s id child
+                match Life.stateOf s.life id with
+                | Dead ->
                     writeVerdict s id "halt"
-        always
-            Life.fire s.life id Life.Stop
+                | _ ->
+                    let died = not (Proc.running child)
+                    if died then
+                        let code = Proc.wait child
+                        let last = Proc.tail child |> Seq.tryLast |> Option.defaultValue "<no output>"
+                        print $"           {Life.pad 12 id} exited (code {show code}), last output: {last}"
+                    if died && Instant.now () < s.deadline then
+                        writeVerdict s id "recover"
+                    else
+                        writeVerdict s id "halt"
+            always
+                Life.fire s.life id Life.Stop
     readVerdict s id
 
 let superviseProc s p =
@@ -180,20 +167,18 @@ let superviseCompose s c =
         c.workingDir
             |> Option.map (fun d -> Path.combine d c.path)
             |> Option.defaultValue c.path
-    // docker-compose is an OPTIONAL backend: a literal head would refuse to
-    // run ANY workspace on a machine without it, so these go through sh -c
-    let compose args = $"docker-compose -f {shq fp} {args}"
-    let rmLine = compose "rm -f"
-    let rmR = sh -c $rmLine | complete
+    // docker-compose is an OPTIONAL backend: ^$dc resolves the head at RUN
+    // time, so an absent docker-compose is a located run error, not a check
+    // refusal - the workspace still checks on a machine without it
+    let dc = "docker-compose"
+    let rmR = ^$dc -f $fp rm -f | complete
     if rmR.exitCode <> 0 then printerr $"[{id}] docker-compose rm failed (exit {show rmR.exitCode})"
-    let pullLine = compose "pull"
-    let pullR = sh -c $pullLine | complete
+    let pullR = ^$dc -f $fp pull | complete
     if pullR.exitCode <> 0 then printerr $"[{id}] docker-compose pull failed (exit {show pullR.exitCode})"
     Life.fire s.life id Life.Init
-    let upLine = compose "up --force-recreate"
     within
         Life.fire s.life id Life.Start
-        within proc child = sh -c $upLine
+        within proc child = ^$dc -f $fp up --force-recreate
             within
                 Duration.sleep s.period
                 let budget = (s.deadline - Instant.now ()) + 60s
@@ -201,12 +186,14 @@ let superviseCompose s c =
                     tickCompose s id child
             always
                 Life.fire s.life id Life.Stop
-                let stopLine = compose "stop"
-                let _stopR = sh -c $stopLine | complete
+                // best-effort teardown: compose stop failure is tolerated -
+                // the down below still runs and the child is already reaped
+                let _stopR = ^$dc -f $fp stop | complete
                 ()
     always
-        let downLine = compose "down"
-        let _downR = sh -c $downLine | complete
+        // best-effort teardown: compose down failure is tolerated - nothing
+        // downstream depends on it and Destroy must still fire
+        let _downR = ^$dc -f $fp down | complete
         Life.fire s.life id Life.Destroy
 
 // ---- stubs (the not-ported teach) ----
