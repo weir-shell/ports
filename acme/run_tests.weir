@@ -3,7 +3,7 @@
 // Ensures keys exist first, then runs each suite as a child weir process.
 
 let dir = Self.scriptPath |> Path.dir
-let _keys = sh -c $"sh {dir}/test/gen_keys.sh" | orFail "key generation failed"
+let _keys = sh $"{dir}/test/gen_keys.sh" | orFail "key generation failed"
 
 let suites = ["test/test_encoding.weir"; "test/test_jws.weir"; "test/test_http.weir"]
 for s in suites do

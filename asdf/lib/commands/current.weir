@@ -6,17 +6,10 @@
 
 import "../core.weir" as Core
 
-// printf "%-15s %-15s %-10s\n" — weir has no Str.padRight [FINDING], so
-// a left-pad helper: append spaces to a minimum width (never truncates,
-// matching printf's %-Ns).
-let padRight w s =
-    let n = w - Str.length s
-    if n <= 0 then s
-    else s + (Seq.replicate n " " |> Str.join "")
-
 // one row, matching bash's terminal_format "%-15s %-15s %-10s\n"
+// (Str.padRight is .NET Pad semantics: never truncates, matching %-Ns)
 let row plugin version desc =
-    $"{padRight 15 plugin} {padRight 15 version} {padRight 10 desc}"
+    $"{Str.padRight 15 plugin} {Str.padRight 15 version} {Str.padRight 10 desc}"
 
 // plugin_current_command: resolve, check installs, print the row.
 // Returns the exit status (0 ok, 1 not-installed, 126 no-version).
