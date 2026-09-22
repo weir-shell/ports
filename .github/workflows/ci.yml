@@ -18,7 +18,13 @@ jobs:
         run: |
           TAG="$(cat TARGET_WEIR_RELEASE)"
           echo "target: $TAG"
-          curl -sSf https://weir.sh | sh
+          # install EXACTLY the pinned release (the currency gate's point),
+          # from that release's own pinned installer asset. The bare
+          # https://weir.sh is the HTML landing page (piping it to sh is a
+          # syntax error) and weir.sh/install.sh is always-latest; the
+          # per-release asset is the only version-pinned source. -L follows
+          # GitHub's 302 to the asset host.
+          curl -fsSL "https://github.com/weir-shell/weir/releases/download/$TAG/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: version is at least the target

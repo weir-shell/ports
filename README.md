@@ -46,7 +46,7 @@ logic errors obvious (asdf's version-starring, ring's unpassed compose env).
 ## Running a port
 
 ```sh
-curl -sSf https://weir.sh | sh          # installs the latest weir
+curl -fsSL https://weir.sh/install.sh | sh   # installs the latest weir
 cd asdf && weir check bin/asdf.weir     # typecheck (runs nothing)
 weir test/run.weir                      # the port's own harness
 ```
