@@ -122,7 +122,7 @@ let signRs256 keyfile signingInput =
         let sigFile = $"{d}/sig.bin"
         [signingInput] |> File.write inFile
         // openssl dgst -sha256 -sign key -out sig input
-        let _r = openssl dgst -sha256 -sign $keyfile -out $sigFile $inFile | orFail "openssl sign failed"
+        openssl dgst -sha256 -sign $keyfile -out $sigFile $inFile | orFail "openssl sign failed"
         File.readBytes sigFile |> Enc.bytesToB64url
 
 /// Sign with an EC key (ES256/384/512). openssl emits a DER ECDSA signature
@@ -137,7 +137,7 @@ let signEs keyfile coordLen signingInput =
         let derFile = $"{d}/sig.der"
         [signingInput] |> File.write inFile
         let hashAlg = $"-sha{coordLen * 8}"
-        let _r = openssl dgst $hashAlg -sign $keyfile -out $derFile $inFile | orFail "openssl EC sign failed"
+        openssl dgst $hashAlg -sign $keyfile -out $derFile $inFile | orFail "openssl EC sign failed"
         // asn1parse yields two INTEGER lines with ":HEX" tails.
         let ints =
             openssl asn1parse -inform DER -in $derFile

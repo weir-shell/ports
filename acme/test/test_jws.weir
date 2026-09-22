@@ -60,11 +60,11 @@ let rsaParsed = [rsaJws] |> from json FlatIn
 let rsaInput = $"{rsaParsed.protected}.{rsaParsed.payload}"
 
 [rsaInput] |> File.write $"{tmp}/rin"
-let _s1 = openssl dgst -sha256 -sign $rsaKey -out $"{tmp}/rsig" $"{tmp}/rin" | orFail "oracle rsa sign"
+openssl dgst -sha256 -sign $rsaKey -out $"{tmp}/rsig" $"{tmp}/rin" | orFail "oracle rsa sign"
 let rOracle = File.readBytes $"{tmp}/rsig" |> Enc.bytesToB64url
 check "RSA JWS sig byte-matches openssl (deterministic)" (rsaParsed.signature == rOracle)
 
-let _pub = openssl rsa -in $rsaKey -pubout -out $"{tmp}/rpub" | orFail "rsa pubout"
+openssl rsa -in $rsaKey -pubout -out $"{tmp}/rpub" | orFail "rsa pubout"
 Enc.b64urlToBytes rsaParsed.signature |> File.writeBytes $"{tmp}/rsig2"
 let rVerify = openssl dgst -sha256 -verify $"{tmp}/rpub" -signature $"{tmp}/rsig2" $"{tmp}/rin" | succeeds
 check "RSA JWS openssl-verifies" rVerify
@@ -97,7 +97,7 @@ let seqLen = (Str.length seqBody) / 2
 let derHex = "30" + (Enc.byteToHex seqLen) + seqBody
 Enc.b64urlToBytes (Enc.hexToB64url derHex) |> File.writeBytes $"{tmp}/ecsig"
 [ecInput] |> File.write $"{tmp}/ecin"
-let _ecpub = openssl ec -in $ecKey -pubout -out $"{tmp}/ecpub" | orFail "ec pubout"
+openssl ec -in $ecKey -pubout -out $"{tmp}/ecpub" | orFail "ec pubout"
 let ecVerify = openssl dgst -sha256 -verify $"{tmp}/ecpub" -signature $"{tmp}/ecsig" $"{tmp}/ecin" | succeeds
 check "EC JWS openssl-verifies (DER-reconstructed)" ecVerify
 

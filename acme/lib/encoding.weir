@@ -6,9 +6,9 @@ module Encoding
 //   _durl_replace_base64 -> re-pad + tr '_-' '/+'            [b64urlToB64]
 //   _h2b / _hex_dump (hex<->bytes)                           [hexToBytes / bytesToHex]
 //
-// weir HAS base64 (Str/Bytes.toBase64, fromBase64) but NOT base64url and NOT
-// hex<->bytes. base64url is a thin transform on top; hex is hand-rolled here
-// (no Bytes.fromHex / Str.fromHex in the surface — see FINDINGS).
+// weir HAS base64 (Str/Bytes.toBase64, fromBase64) and hex<->bytes
+// (Bytes.fromHex / Bytes.toHex, since v0.0.46) but NOT base64url. base64url is
+// a thin transform on top; hex<->base64 rides the native Bytes codec.
 
 /// base64 (standard, unwrapped) -> base64url: '+'->'-', '/'->'_', strip '=' pad.
 /// The acme.sh _url_replace idiom. '=' only ever appears as trailing padding in
@@ -84,100 +84,22 @@ let byteToHex n =
     let lo = digits |> Str.sub (n % 16) 1
     hi + lo
 
-// hex string (even length, lowercase) -> base64url, WITHOUT a Bytes round-trip.
-// We fold hex pairs into a base64 string via the byte values. Simplest faithful
-// route: hex -> base64 by building bytes through Bytes.fromBase64 is circular,
-// so instead we compute base64 from the raw byte values directly is heavy;
-// the pragmatic weir route is hex -> a Bytes value. Since there is no
-// Bytes.ofInts either, we go hex -> base64 through the ONE bridge weir gives:
-// decode. We therefore expose hexToB64url built on a small pure encoder below.
-
-/// hex string -> seq of byte values (0..255).
-let hexToByteVals : string -> seq<int>
-
-let hexToByteVals hex =
-    let clean = hex |> Str.toLower |> Str.replace " " "" |> Str.replace ":" ""
-    let n = Str.length clean
-    [0 .. ((n / 2) - 1)]
-    |> Seq.map (fun i ->
-        let hi = clean |> Str.sub (i * 2) 1 |> hexDigit
-        let lo = clean |> Str.sub (i * 2 + 1) 1 |> hexDigit
-        hi * 16 + lo)
-
-// base64 alphabet, standard.
-let b64alphabet : string
-
-let b64alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-/// encode a seq of byte values (0..255) to a standard base64 string.
-/// Pure re-implementation (no Bytes bridge for arbitrary int seqs exists).
-let bytesValsToB64 : seq<int> -> string
-
-let bytesValsToB64 vals =
-    let arr = vals |> Seq.freeze
-    let total = arr |> Seq.length
-    let b64char i = b64alphabet |> Str.sub i 1
-    [0 .. (((total + 2) / 3) - 1)]
-    |> Seq.map (fun blk ->
-        let i = blk * 3
-        let b0 = arr |> Seq.item i
-        let has1 = i + 1 < total
-        let has2 = i + 2 < total
-        let b1 = if has1 then arr |> Seq.item (i + 1) else 0
-        let b2 = if has2 then arr |> Seq.item (i + 2) else 0
-        let c0 = b64char (b0 / 4)
-        let c1 = b64char ((b0 % 4) * 16 + b1 / 16)
-        let c2 = if has1 then b64char ((b1 % 16) * 4 + b2 / 64) else "="
-        let c3 = if has2 then b64char (b2 % 64) else "="
-        c0 + c1 + c2 + c3)
-    |> Str.join ""
+// hex <-> base64 now ride the native Bytes codec (Bytes.fromHex / Bytes.toHex,
+// present since v0.0.46). The heavy hand-rolled base64/hex encoders are gone;
+// byteToHex/hexDigit are KEPT above as small self-contained helpers the tests
+// still call directly (test_jws hand-assembles DER via them).
 
 /// hex string -> base64url (the acme.sh `_h2b | _base64 | _url_replace` chain).
 let hexToB64url : string -> string
 
-let hexToB64url hex = hex |> hexToByteVals |> bytesValsToB64 |> b64ToB64url
+let hexToB64url hex = hex |> Bytes.fromHex |> Bytes.toBase64 |> b64ToB64url
 
 /// hex string -> standard base64 (the `_h2b | _base64` chain, no url-replace).
 let hexToB64 : string -> string
 
-let hexToB64 hex = hex |> hexToByteVals |> bytesValsToB64
+let hexToB64 hex = hex |> Bytes.fromHex |> Bytes.toBase64
 
-/// bytes -> lowercase hex string (the _hex_dump direction). Round-trips through
-/// base64 since Bytes exposes no per-byte access; we decode base64 chars.
+/// bytes -> lowercase hex string (the _hex_dump direction).
 let bytesToHex : Bytes -> string
 
-let bytesToHex b =
-    // Bytes -> base64 -> byte values -> hex. We reuse the base64 decode by
-    // re-encoding: simplest is to go via Bytes.toBase64 then decode to vals.
-    let b64 = Bytes.toBase64 b
-    // decode base64 string to byte values via an alphabet->index map.
-    let idxMap =
-        [0 .. 63]
-        |> Seq.map (fun i -> (b64alphabet |> Str.sub i 1, i))
-        |> Map.ofPairs
-    let idx c = Map.get c idxMap
-    let clean = b64 |> Str.replace "=" ""
-    let padCount = (Str.length b64) - (Str.length clean)
-    let chars = [0 .. ((Str.length clean) - 1)] |> Seq.map (fun i -> clean |> Str.sub i 1)
-    let sixbits = chars |> Seq.map idx |> Seq.freeze
-    let nChars = sixbits |> Seq.length
-    // every 4 chars -> 3 bytes
-    let bytesOut =
-        [0 .. (((nChars + 3) / 4) - 1)]
-        |> Seq.collect (fun blk ->
-            let i = blk * 4
-            let s0 = sixbits |> Seq.item i
-            let s1 = if i + 1 < nChars then sixbits |> Seq.item (i + 1) else 0
-            let s2 = if i + 2 < nChars then sixbits |> Seq.item (i + 2) else 0
-            let s3 = if i + 3 < nChars then sixbits |> Seq.item (i + 3) else 0
-            let byte0 = s0 * 4 + s1 / 16
-            let byte1 = (s1 % 16) * 16 + s2 / 4
-            let byte2 = (s2 % 4) * 64 + s3
-            [byte0; byte1; byte2])
-        |> Seq.freeze
-    let _pad = padCount
-    let totalBytes = Bytes.length b |> Size.toBytes
-    bytesOut
-    |> Seq.take totalBytes
-    |> Seq.map byteToHex
-    |> Str.join ""
+let bytesToHex b = Bytes.toHex b
