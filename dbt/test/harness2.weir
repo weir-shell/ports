@@ -52,11 +52,11 @@ let slnxDoc = [
 slnxDoc |> File.write $"{root}/sln/app.slnx"
 
 within cd root
-    let _i = git init -q | complete
-    let _n = git config user.name t | complete
-    let _e = git config user.email t@t | complete
-    let _a = git add -A | complete
-    let _c = git commit -qm "init" | complete
+    git init -q | orFail "fixture setup: git init failed"
+    git config user.name t | orFail "fixture setup: git config user.name failed"
+    git config user.email t@t | orFail "fixture setup: git config user.email failed"
+    git add -A | orFail "fixture setup: git add failed"
+    git commit -qm "init" | orFail "fixture setup: init commit failed"
 
     // ---------- BICEP SELECTOR ----------
     print "== BICEP =="

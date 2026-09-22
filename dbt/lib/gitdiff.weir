@@ -51,7 +51,7 @@ let resolveBaseRefs currentCommit strategy =
         let resolved = git rev-parse $r |> Seq.exactlyOne |> Str.trim
         [resolved]
     | MergeBase branch ->
-        let _f = git fetch origin $"{branch}:refs/remotes/origin/{branch}" | complete
+        git fetch origin $"{branch}:refs/remotes/origin/{branch}" | orFail "git fetch failed: a missing/stale remote ref would silently yield a wrong merge-base (fsx runSimpleGitCommand raised here too)"
         let mb = git merge-base $"origin/{branch}" $currentCommit |> Seq.exactlyOne |> Str.trim
         [mb]
 

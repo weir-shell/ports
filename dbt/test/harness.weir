@@ -29,11 +29,11 @@ csproj "<TargetFramework>net10.0</TargetFramework>" |> File.write $"{root}/c/nes
 ["readme"] |> File.write $"{root}/README.md"
 
 within cd root
-    let _i = git init -q | complete
-    let _n = git config user.name t | complete
-    let _e = git config user.email t@t | complete
-    let _a1 = git add -A | complete
-    let _c1 = git commit -qm "init: [CHANGE-KEY-base] baseline" | complete
+    git init -q | orFail "fixture setup: git init failed"
+    git config user.name t | orFail "fixture setup: git config user.name failed"
+    git config user.email t@t | orFail "fixture setup: git config user.email failed"
+    git add -A | orFail "fixture setup: git add failed"
+    git commit -qm "init: [CHANGE-KEY-base] baseline" | orFail "fixture setup: baseline commit failed"
     let baseSha = git rev-parse HEAD |> Seq.exactlyOne |> Str.trim
     // change a file DEEP below a/'s project file, to exercise the
     // ancestor walk-up (findParentProjectPath): a/deep/sub/n.cs has no
@@ -41,8 +41,8 @@ within cd root
     Dir.create $"{root}/a/deep/sub"
     ["nested change"] |> File.write $"{root}/a/deep/sub/n.cs"
     ["world"; "touch"] |> File.write $"{root}/c/nested/Lib.fs"
-    let _a2 = git add -A | complete
-    let _c2 = git commit -qm "feat: a and c [CHANGE-KEY-feat1] and [CHANGE-KEY-feat2]" | complete
+    git add -A | orFail "fixture setup: git add (feat commit) failed"
+    git commit -qm "feat: a and c [CHANGE-KEY-feat1] and [CHANGE-KEY-feat2]" | orFail "fixture setup: feat commit failed"
     let curSha = git rev-parse HEAD |> Seq.exactlyOne |> Str.trim
 
     let profile = Types.Profile {
