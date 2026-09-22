@@ -9,7 +9,7 @@ module CiSpec
 // `to json`-able — which is the whole point (deploy-spec/output serialise
 // it to a CI output channel).
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// One image to deploy (types.fsx ImageSpec). `digest` is filled later by
 /// the build; the deploy-spec emits None.

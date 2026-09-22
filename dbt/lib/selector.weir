@@ -16,7 +16,7 @@ module Selector
 // The "excludes merge in reverse order" CE artifact (test-plan.fsx) does
 // NOT arise here — append is append, in declaration order.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// The subset of a Selector a caller usually overrides. Every field is
 /// optional: absent = inherit the base. `addPatterns`/`addExcludes`
@@ -57,7 +57,7 @@ let noOverrides =
 let extend : Selector -> OverrideSpec -> Selector
 
 let extend base spec =
-    T.Selector {
+    Types.Selector {
         id = spec.id |> Option.defaultValue base.id
         patterns = spec.addPatterns |> Seq.append base.patterns |> Seq.freeze
         excludePatterns = spec.addExcludes |> Seq.append base.excludePatterns |> Seq.freeze

@@ -8,7 +8,7 @@
 // Oracle status per slice is stated in FINDINGS; here every assert is
 // exit-code (fail => exit 1).
 
-import "./../lib/types.weir" as T
+import "./../lib/types.weir" as Types
 import "./../lib/plan.weir" as Dbt
 import "./../lib/discover.weir" as Discover
 import "./../lib/selector.weir" as Sel
@@ -118,16 +118,16 @@ within cd root
 
     // ---------- SNAPSHOT write/validate ----------
     print "== SNAPSHOT =="
-    let out = T.PlanOutput {
+    let out = Types.PlanOutput {
         requiredProjects = [
-            T.ProjectMetadata {
+            Types.ProjectMetadata {
                 fileName = "A.csproj"; fileNameNoExtension = "A"; fullPath = "sln/A/A.csproj"
                 fullDir = "sln/A"; dir = "A"; dirSlug = "a"; relativePath = "sln/A/A.csproj"
                 relativeDir = "sln/A"; projectId = "sln-a"; kind = "slnx"
             }
         ]
         changeKeys = Some ["CHANGE-KEY-x"]
-        changeSetRange = Some (T.ChangeSetRange { baseCommits = ["bbbbbbbccc"]; currentCommit = "aaaaaaaddd" })
+        changeSetRange = Some (Types.ChangeSetRange { baseCommits = ["bbbbbbbccc"]; currentCommit = "aaaaaaaddd" })
         changedDirs = Some (Map.ofPairs [("sln", ["sln/app.slnx"])])
     }
     let snapDir = Path.newTempDir ()

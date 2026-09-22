@@ -16,7 +16,7 @@ module Slnx
 // lists (expand_leafs), so touching a solution rebuilds its members —
 // the .slnx is the unit of discovery, the .csprojs are the leaves.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// One `<Project Path="…"/>` entry. `[<Attr "Path">]` reads the attribute
 /// (the project's path relative to the .slnx file's directory).
@@ -78,7 +78,7 @@ let expandLeafs ctx =
 let generic : Selector
 
 let generic =
-    T.Selector {
+    Types.Selector {
         id = "slnx"
         patterns = ["*.slnx"]
         excludePatterns = []

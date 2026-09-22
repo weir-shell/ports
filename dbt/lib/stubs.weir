@@ -17,7 +17,7 @@ module Stubs
 //   - snapshot write/validate (fsx/snapshot.fsx): PlanOutput is already
 //       serialisable via `to json`, so snapshotting is a thin Stage-2 add.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// A selector that is declared but not ported — every probe fails with
 /// its origin. Kept as a value so a plan referencing it type-checks and

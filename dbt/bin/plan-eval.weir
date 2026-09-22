@@ -12,7 +12,7 @@
 // commits, sorted per-dir files, projects sorted by relativePath), and writes
 // its JSON. Serialisation is byte-for-byte the snapshot shape dbt writes.
 
-import "./../lib/types.weir" as T
+import "./../lib/types.weir" as Types
 import "./../lib/plan.weir" as Dbt
 import "./../lib/dotnet.weir" as Dotnet
 import "./../lib/bicep.weir" as Bicep
@@ -22,7 +22,7 @@ import "./../lib/snapshot.weir" as Snapshot
 // test-dbt/plan.fsx: the DEFAULT profile — the dotnet selector with
 // required_when isPublishable + leaf-dependant expansion (Dotnet.default),
 // scraping change keys.
-let defaultProfile = T.Profile {
+let defaultProfile = Types.Profile {
     id = "default"
     includeRootDir = false
     changeKeyRegex = Some @"(CHANGE-KEY-[a-z0-9]+)"
@@ -37,14 +37,14 @@ let bicepSelector =
         Selector.noOverrides with discoveryRoot = Some "bicep"
     }
 
-let bicepProfile = T.Profile {
+let bicepProfile = Types.Profile {
     id = "bicep"
     includeRootDir = false
     changeKeyRegex = None
     selector = bicepSelector
 }
 
-let buildPlan = T.BuildPlan {
+let buildPlan = Types.BuildPlan {
     profiles = Map.ofPairs [
         ("default", defaultProfile)
         ("bicep", bicepProfile)

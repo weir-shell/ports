@@ -22,7 +22,7 @@ module Bicep
 //    reaching from a changed .bicep yields every transitive dependant;
 //    keep the ones the selector calls required (the .bicepparam leaves).
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// A bicep file is required iff it is a deployable leaf: a .bicepparam
 /// (project.fsx required_when: Path.GetExtension f = ".bicepparam").
@@ -113,7 +113,7 @@ let expandLeafs ctx =
 let generic : Selector
 
 let generic =
-    T.Selector {
+    Types.Selector {
         id = "bicep"
         patterns = ["*.bicep"; "*.bicepparam"]
         excludePatterns = []

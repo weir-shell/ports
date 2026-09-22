@@ -10,7 +10,7 @@ module Plan
 // verbs entirely — the port keeps dbt's name at the module boundary,
 // where weir's keyword never appears.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 import "./gitdiff.weir" as GitDiff
 import "./discover.weir" as Discover
 
@@ -37,7 +37,7 @@ type DbtEnv = {
 let modeOf : DbtEnv -> Mode
 
 let modeOf env =
-    env.DBT_MODE |> Option.defaultValue T.Diff
+    env.DBT_MODE |> Option.defaultValue Types.Diff
 
 /// Resolve the base-commit strategy (plan.fsx baseCommitStrategy):
 /// a PR target branch -> MergeBase; else an explicit fromRef ->
@@ -46,11 +46,11 @@ let baseStrategy : DbtEnv -> Option<string> -> BaseStrategy
 
 let baseStrategy env fromRef =
     match env.DBT_PR_TARGET_BRANCH with
-    | Some branch -> T.MergeBase branch
+    | Some branch -> Types.MergeBase branch
     | None ->
         match fromRef with
-        | Some r -> T.Override r
-        | None -> T.Parent
+        | Some r -> Types.Override r
+        | None -> Types.Parent
 
 /// Evaluate a build plan (plan.fsx Plan.evaluate). Reads DbtEnv, picks
 /// the profile, computes changed dirs (Diff) or all dirs (All), runs

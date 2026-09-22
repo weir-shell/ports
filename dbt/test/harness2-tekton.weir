@@ -9,7 +9,7 @@
 // Tests: the PURE last-success logic (oracle'd structurally), the filter
 // shaping, and the deploy-spec JSON shaping.
 
-import "./../lib/types.weir" as T
+import "./../lib/types.weir" as Types
 import "./../lib/cispec.weir" as Spec
 import "./../lib/ci_tekton.weir" as Tek
 
@@ -17,9 +17,9 @@ let assert cond msg =
     if not cond then fail $"ASSERT FAILED: {msg}"
     else print $"ok: {msg}"
 
-let out = T.PlanOutput {
+let out = Types.PlanOutput {
     requiredProjects = [
-        T.ProjectMetadata {
+        Types.ProjectMetadata {
             fileName = "A.csproj"; fileNameNoExtension = "A"; fullPath = "sln/A/A.csproj"
             fullDir = "sln/A"; dir = "A"; dirSlug = "a"; relativePath = "sln/A/A.csproj"
             relativeDir = "sln/A"; projectId = "sln-a"; kind = "slnx"

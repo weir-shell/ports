@@ -6,7 +6,7 @@
 //
 // Run from anywhere; it makes its own temp git repo and cds into it.
 
-import "./../lib/types.weir" as T
+import "./../lib/types.weir" as Types
 import "./../lib/plan.weir" as Dbt
 import "./../lib/dotnet.weir" as Dotnet
 
@@ -45,13 +45,13 @@ within cd root
     let _c2 = git commit -qm "feat: a and c [CHANGE-KEY-feat1] and [CHANGE-KEY-feat2]" | complete
     let curSha = git rev-parse HEAD |> Seq.exactlyOne |> Str.trim
 
-    let profile = T.Profile {
+    let profile = Types.Profile {
         id = "default"
         includeRootDir = false
         changeKeyRegex = Some @"(CHANGE-KEY-[a-z0-9]+)"
         selector = Dotnet.generic
     }
-    let buildPlan = T.BuildPlan {
+    let buildPlan = Types.BuildPlan {
         profiles = Map.ofPairs [("default", profile)]
         range = None
     }
@@ -59,7 +59,7 @@ within cd root
     // ---- DIFF MODE ----
     print "== DIFF =="
     let diffEnv = Dbt.DbtEnv {
-        DBT_MODE = Some T.Diff
+        DBT_MODE = Some Types.Diff
         DBT_PROFILE = "default"
         DBT_CURRENT_COMMIT = Some curSha
         DBT_BASE_COMMIT = Some baseSha
@@ -92,7 +92,7 @@ within cd root
     // ---- ALL MODE ----
     print "== ALL =="
     let allEnv = Dbt.DbtEnv {
-        DBT_MODE = Some T.All
+        DBT_MODE = Some Types.All
         DBT_PROFILE = "default"
         DBT_CURRENT_COMMIT = None
         DBT_BASE_COMMIT = None
@@ -111,7 +111,7 @@ within cd root
     // ---- empty diff (base==current) ----
     print "== EMPTY DIFF =="
     let emptyEnv = Dbt.DbtEnv {
-        DBT_MODE = Some T.Diff
+        DBT_MODE = Some Types.Diff
         DBT_PROFILE = "default"
         DBT_CURRENT_COMMIT = Some curSha
         DBT_BASE_COMMIT = Some curSha

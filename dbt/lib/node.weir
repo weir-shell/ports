@@ -8,14 +8,14 @@ module Node
 // discovery selector — Path.glob "package.json" per directory, exactly
 // the include-only Stage-2 shape. No leaf graph, no excludes.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// The node selector (project.fsx NodeSelectors.image): id "node",
 /// pattern "package.json", all defaults. A package.json IS the project.
 let image : Selector
 
 let image =
-    T.Selector {
+    Types.Selector {
         id = "node"
         patterns = ["package.json"]
         excludePatterns = []

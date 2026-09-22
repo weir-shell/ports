@@ -15,7 +15,7 @@ module CiGithub
 //     oracle-comparable (env in, JSON out).
 //  3. output — append `key=value` to $GITHUB_OUTPUT. Deterministic file IO.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 import "./cispec.weir" as Spec
 
 // ---- API response shapes (last-success-sha.fsx) ----

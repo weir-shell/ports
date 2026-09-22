@@ -14,7 +14,7 @@ module CiTekton
 //  3. output — write a value to a Tekton result file ($RESULT_<name> or
 //     ./<name>.txt).
 
-import "./types.weir" as T
+import "./types.weir" as Types
 import "./cispec.weir" as Spec
 
 // ---- Results API shapes (last-success-sha.fsx) ----

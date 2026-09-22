@@ -16,19 +16,19 @@
 // nested record. The builder's sugar (extend/merge, facet lists, reverse
 // order) is gone; what remains is an ordinary value — see FINDINGS (b).
 
-import "./../lib/types.weir" as T
+import "./../lib/types.weir" as Types
 import "./../lib/plan.weir" as Dbt
 import "./../lib/dotnet.weir" as Dotnet
 
 // The dotnet profile: the generic dotnet selector, scraping change keys.
-let profile = T.Profile {
+let profile = Types.Profile {
     id = "default"
     includeRootDir = false
     changeKeyRegex = Some @"(CHANGE-KEY-[a-z0-9]+)"
     selector = Dotnet.generic
 }
 
-let buildPlan = T.BuildPlan {
+let buildPlan = Types.BuildPlan {
     profiles = Map.ofPairs [("default", profile)]
     range = None
 }

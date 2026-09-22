@@ -22,7 +22,7 @@ module Snapshot
 //  - ChangeSetRange carries seqs; to keep the record serialisable and
 //    comparable we sort baseCommits (dbt: `r.baseCommits |> List.sort`).
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// The stable per-project subset dbt snapshots (snapshot.fsx
 /// SnapshotProject).

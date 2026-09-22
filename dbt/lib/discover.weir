@@ -6,7 +6,7 @@ module Discover
 // exclude-pattern combinator, so excludes are hand-rolled substring
 // contains (matching dbt's relative-path AddExcludePatterns intent).
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// Does a project file match the include patterns? Patterns are file
 /// globs like "*.*sproj" applied to files DIRECTLY in `dir`

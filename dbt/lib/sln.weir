@@ -24,7 +24,7 @@ module Sln
 // ever keyed by the SAME repo-relative project paths discovery produces, so
 // the relative framing is faithful and self-consistent.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// One project row parsed from a `.sln`: the display name, the (normalised,
 /// repo-relative) project-file path, and the project GUID.

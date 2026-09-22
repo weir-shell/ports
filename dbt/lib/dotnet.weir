@@ -13,7 +13,7 @@ module Dotnet
 // and `default` mirrors test-dbt/plan.fsx's default profile:
 // required_when isPublishable + the leaf-dependant expansion.
 
-import "./types.weir" as T
+import "./types.weir" as Types
 import "./sln.weir" as Sln
 
 // A <PropertyGroup> may repeat; each carries the properties we probe as
@@ -97,7 +97,7 @@ let expandLeafsPackable ctx =
 let generic : Selector
 
 let generic =
-    T.Selector {
+    Types.Selector {
         id = "dotnet"
         patterns = ["*.*sproj"]
         excludePatterns = []
@@ -117,7 +117,7 @@ let generic =
 let default : Selector
 
 let default =
-    T.Selector {
+    Types.Selector {
         id = "dotnet"
         patterns = ["*.*sproj"]
         excludePatterns = []
@@ -142,7 +142,7 @@ let image = default
 let nuget : Selector
 
 let nuget =
-    T.Selector {
+    Types.Selector {
         id = "dotnet"
         patterns = ["*.*sproj"]
         excludePatterns = []

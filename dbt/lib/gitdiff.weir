@@ -4,7 +4,7 @@ module GitDiff
 // member of fsx/tools/git.fsx. Uses the `git` literal command head
 // throughout (weir resolves it at check time).
 
-import "./types.weir" as T
+import "./types.weir" as Types
 
 /// Relative dir of a repo-root-relative file path ("" -> ".", matching
 /// .NET's Path.GetRelativePath of a top-level file's dir to cwd).
@@ -92,8 +92,8 @@ let dirsFromDiff includeRoot strategy toRef =
         |> Seq.collect (fun b -> changedFiles b currentCommit)
         |> Seq.freeze
     let dirs = groupDirs includeRoot allChanged |> existingDirs
-    T.DiffResult {
-        effectiveRange = T.ChangeSetRange { baseCommits = baseRefs; currentCommit = currentCommit }
+    Types.DiffResult {
+        effectiveRange = Types.ChangeSetRange { baseCommits = baseRefs; currentCommit = currentCommit }
         dirs = dirs
     }
 
