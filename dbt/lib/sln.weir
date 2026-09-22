@@ -1,0 +1,196 @@
+module Sln
+
+// A classic `.sln` (Visual Studio solution) parser + the project-reference
+// dependency graph, ported from fsx/dotnet/solution.fsx.
+//
+// dbt uses Ionide.ProjInfo's `tryParseSln` to read the bespoke `.sln` text
+// format, then builds a ProjectReference graph via XPathDocument over each
+// csproj. This port owns the `.sln` parse with a deterministic regex (the
+// yaml-subset playbook — never hand-write a parser, read the format's own
+// grammar) and reads `<ProjectReference Include="…"/>` via `from xml`, the
+// csproj win Stage-1 proved.
+//
+// THE `.sln` GRAMMAR (the only lines the port needs):
+//   Project("{type-guid}") = "Name", "rel\path.csproj", "{proj-guid}"
+// One project per line. A solution FOLDER row has the same shape but its
+// path is a bare folder name (no `.csproj`/`.fsproj`), so filtering to
+// project extensions drops folder rows. The `Global`/config tail is ignored.
+//
+// Paths in a `.sln` use `\` separators and are relative to the `.sln`'s own
+// directory; the port normalises `\`→`/`, joins against that directory, and
+// normalises the result — repo-relative, matching how discovery addresses
+// every file (the evaluator runs at the repo root; git yields relative
+// paths). dbt's `Path.GetFullPath` gives absolutes, but the graph is only
+// ever keyed by the SAME repo-relative project paths discovery produces, so
+// the relative framing is faithful and self-consistent.
+
+import "./types.weir" as T
+
+/// One project row parsed from a `.sln`: the display name, the (normalised,
+/// repo-relative) project-file path, and the project GUID.
+type SlnProject = {
+    name: string
+    path: string
+    guid: string
+}
+
+/// The `Project("{…}") = "Name", "rel\path", "{guid}"` line pattern. Three
+/// capturing groups: name, path, guid (the guid inside `{…}`). The tail of
+/// the line (config sections) is never on a `Project(...)` line, so a single
+/// anchored match per line suffices.
+let projectLinePattern : string
+
+let projectLinePattern =
+    @"Project\(""\{[^}]+\}""\) = ""([^""]+)"", ""([^""]+)"", ""\{([^}]+)\}"""
+
+/// True if a path names a dotnet project file (`.csproj`/`.fsproj`) — the
+/// filter that drops solution-folder rows (whose path is a bare folder name).
+let isProjectPath : string -> bool
+
+let isProjectPath path =
+    let ext = Path.extension path
+    ext == ".csproj" || ext == ".fsproj"
+
+/// Parse the `.sln` at `slnPath` into its project rows (folder rows dropped).
+/// Each row's path is normalised (`\`→`/`), joined against the `.sln`'s own
+/// directory, and lexically normalised — repo-relative, distinct.
+let parse : string -> seq<SlnProject>
+
+let parse slnPath =
+    let dir = Path.dir slnPath
+    File.read slnPath
+    |> Seq.collect (fun line -> Str.rmatchAll projectLinePattern line)
+    |> Seq.map (fun g ->
+        let name = g |> Seq.head
+        let rawPath = g |> Seq.skip 1 |> Seq.head
+        let guid = g |> Seq.skip 2 |> Seq.head
+        let relPath = rawPath |> Str.replace @"\" "/"
+        let normPath = Path.combine dir relPath |> Path.normalize
+        SlnProject { name = name; path = normPath; guid = guid })
+    |> Seq.where (fun p -> isProjectPath p.path)
+    |> Seq.distinctBy (fun p -> p.path)
+    |> Seq.freeze
+
+/// Just the project-file paths a `.sln` names (solution.fsx findProjects
+/// without a filter): repo-relative, distinct.
+let projectPaths : string -> seq<string>
+
+let projectPaths slnPath =
+    parse slnPath |> Seq.map (fun p -> p.path) |> Seq.freeze
+
+// --- The ProjectReference dependency graph (solution.fsx makeDependencyTree) ---
+
+/// One `<ProjectReference Include="…"/>` entry inside a csproj `<ItemGroup>`.
+type ProjectRef = {
+    [<Attr>]
+    Include: string
+}
+
+/// A csproj `<ItemGroup>` may carry ProjectReferences (among other items).
+type CsprojItemGroup = {
+    [<Elem "ProjectReference">]
+    refs: seq<ProjectRef>
+}
+
+/// The csproj root — repeated `<ItemGroup>`s, each possibly holding
+/// ProjectReferences. `from xml` maps the field to child elements by local
+/// name; MSBuild's default xmlns is stripped so names stay plain.
+type Csproj = {
+    [<Elem "ItemGroup">]
+    groups: seq<CsprojItemGroup>
+}
+
+/// The projects a csproj references, as normalised repo-relative paths
+/// (solution.fsx getProjReferenceDeps: read every `<ProjectReference
+/// Include>`, resolve `\`→`/` against the csproj's own directory). A missing
+/// file yields no references.
+let projectReferences : string -> seq<string>
+
+let projectReferences projPath =
+    if not (File.exists projPath) then
+        []
+    else
+        let dir = Path.dir projPath
+        let doc = File.read projPath |> from xml Csproj
+        doc.groups
+        |> Seq.collect (fun ig -> ig.refs)
+        |> Seq.map (fun r ->
+            let rel = r.Include |> Str.replace @"\" "/"
+            Path.combine dir rel |> Path.normalize)
+        |> Seq.distinct
+        |> Seq.freeze
+
+/// Build the REVERSE dependency graph over a `.sln`'s projects
+/// (solution.fsx makeDependencyTree): for each project, read its
+/// ProjectReferences and emit `(referenced -> referrer)` pairs, then group
+/// by the referenced project. So `Map.tryGet dep tree` gives every project
+/// that transitively references `dep` at one hop — reaching FROM a changed
+/// project finds every downstream dependant. dbt keys the graph by the
+/// referenced project exactly the same way (`Seq.groupBy fst`).
+let makeDependencyTree : string -> Map<string, seq<string>>
+
+let makeDependencyTree slnPath =
+    projectPaths slnPath
+    |> Seq.collect (fun proj ->
+        projectReferences proj |> Seq.map (fun dep -> (dep, proj)))
+    |> Seq.groupBy (fun (dep, _) -> dep)
+    |> Seq.map (fun (dep, pairs) ->
+        (dep, pairs |> Seq.map (fun (_, referrer) -> referrer) |> Seq.distinct |> Seq.freeze))
+    |> Map.ofPairs
+
+/// The LEAF dependants reachable from a changed project (solution.fsx
+/// findLeafDependants): reverse-reachability over the dependency tree,
+/// STOPPING at leaf projects — a changed non-leaf project expands to every
+/// leaf that transitively depends on it; a changed leaf expands to itself.
+///
+/// dbt's `find`: `if tree.ContainsKey(proj) && not (isLeaf proj) then
+/// recurse into its referrers else yield self`. This is `Graph.reach` over
+/// the reverse graph where a LEAF node contributes NO neighbours (so the
+/// walk halts there), then keeping only leaf nodes. A non-leaf dead-end
+/// (no referrers) is reached but filtered out — and it would be dropped
+/// downstream by `isRequired` regardless (required == isLeaf here), so the
+/// leaf-only filter is faithful to dbt's `proj :: sofar` yield.
+let findLeafDependants : Map<string, seq<string>> -> (string -> bool) -> string -> seq<string>
+
+let findLeafDependants tree isLeaf changedProject =
+    let neighbors proj =
+        if isLeaf proj then []
+        else Map.tryGet proj tree |> Option.defaultValue []
+    Graph.reach (fun p -> p) neighbors changedProject
+    |> Seq.where isLeaf
+    |> Seq.freeze
+
+/// Like findLeafDependants but collects EVERY leaf across the whole reachable
+/// graph rather than halting at the first (solution.fsx findAllLeafDependants,
+/// used by the nuget selector). Here a leaf node STILL exposes its referrers,
+/// so the walk continues past it; every reachable leaf is kept.
+let findAllLeafDependants : Map<string, seq<string>> -> (string -> bool) -> string -> seq<string>
+
+let findAllLeafDependants tree isLeaf changedProject =
+    let neighbors proj = Map.tryGet proj tree |> Option.defaultValue []
+    Graph.reach (fun p -> p) neighbors changedProject
+    |> Seq.where isLeaf
+    |> Seq.freeze
+
+/// Find the single `.sln`/`.slnx` in a directory (solution.fsx findInDir):
+/// the first solution file, or a failure. Used to locate the solution the
+/// dotnet dependency graph is built from.
+///
+/// Returns the path JOINED against `dir` as given (not `Dir.list`'s absolute
+/// path): so `findInDir "."` yields `./Arquidev.Test.sln`, keeping the
+/// dependency tree's project keys REPO-RELATIVE to match how discovery
+/// addresses every project. dbt uses absolute paths throughout, but the
+/// graph is only ever compared against discovery's repo-relative paths, so
+/// the relative framing is the self-consistent choice here.
+let findInDir : string -> string
+
+let findInDir dir =
+    let sln =
+        Dir.list dir
+        |> Seq.where (fun f ->
+            let e = Path.extension f
+            e == ".sln" || e == ".slnx")
+        |> Seq.tryHead
+    match sln with
+    | Some path -> Path.combine dir (Path.fileName path)
+    | None -> fail $"Sln file not found in {dir}"

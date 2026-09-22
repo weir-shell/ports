@@ -1,0 +1,80 @@
+#!/usr/bin/env weir
+
+// Stage-2.5 unit harness for the .sln parser + dependency graph (lib/sln.weir)
+// and the dotnet default selector's leaf expansion. Runs against the real
+// arquidevio/test-dbt fixture's Arquidev.Test.sln (three projects: prime and
+// orange both IsPublishable and both referencing stone; stone IsPackable, a
+// leaf in the graph with no references). Every assert is exit-code (fail ->
+// exit 1).
+//
+// Usage: weir test/harness-sln.weir [FIXTURE_DIR]   (default /tmp/test-dbt)
+
+import "./../lib/sln.weir" as Sln
+import "./../lib/dotnet.weir" as Dotnet
+
+let fixture = Self.args |> Seq.tryHead |> Option.defaultValue "/tmp/test-dbt"
+
+let assert cond msg =
+    if cond then print $"ok: {msg}"
+    else fail $"FAIL: {msg}"
+
+// The parser + graph are always driven from the repo root with a relative
+// solution path (that is how the dotnet selector's expandLeafs calls
+// Sln.findInDir ".") — so every assert runs inside the fixture dir, which
+// keeps the parsed project paths repo-relative, matching discovery.
+
+// --- 1. parse: three project rows, folder rows dropped ---
+let projects = within cd fixture
+    Sln.parse "Arquidev.Test.sln" |> Seq.freeze
+assert ((projects |> Seq.length) == 3) "sln parse: exactly 3 project rows (5 folder rows dropped)"
+
+let paths = within cd fixture
+    Sln.projectPaths "Arquidev.Test.sln" |> Seq.freeze
+let hasPrime = paths |> Seq.contains "prime/Arquidev.Prime.Test/Arquidev.Prime.Test.csproj"
+let hasOrange = paths |> Seq.contains "orange/Arquidev.Orange.Test/Arquidev.Orange.Test.csproj"
+let hasStone = paths |> Seq.contains "stone/Arquidev.Stone.Pkg/Arquidev.Stone.Pkg.csproj"
+assert (hasPrime && hasOrange && hasStone) "sln parse: prime + orange + stone paths, repo-relative"
+
+let noFolder = paths |> Seq.forall (fun p -> Path.extension p == ".csproj" || Path.extension p == ".fsproj")
+assert noFolder "sln parse: every kept path is a .csproj/.fsproj"
+
+// --- 2. project references via from xml (paths are cwd-relative, so read
+// from inside the fixture) ---
+let primeRefsInFixture =
+    within cd fixture
+        Sln.projectReferences "prime/Arquidev.Prime.Test/Arquidev.Prime.Test.csproj" |> Seq.freeze
+assert (primeRefsInFixture |> Seq.contains "stone/Arquidev.Stone.Pkg/Arquidev.Stone.Pkg.csproj")
+    "csproj ProjectReference: prime references stone"
+
+// --- 3. reverse dependency graph ---
+let tree = within cd fixture
+    Sln.makeDependencyTree "Arquidev.Test.sln"
+let stoneReferrers = Map.tryGet "stone/Arquidev.Stone.Pkg/Arquidev.Stone.Pkg.csproj" tree |> Option.defaultValue [] |> Seq.freeze
+assert ((stoneReferrers |> Seq.length) == 2) "dep graph: stone has 2 referrers (prime, orange)"
+
+// --- 4. findLeafDependants: reverse reachability, stopping at leaves ---
+let isLeaf p = within cd fixture (Dotnet.isPublishable p)
+let stoneLeaves = within cd fixture
+    Sln.findLeafDependants (Sln.makeDependencyTree "Arquidev.Test.sln") Dotnet.isPublishable "stone/Arquidev.Stone.Pkg/Arquidev.Stone.Pkg.csproj"
+    |> Seq.freeze
+assert ((stoneLeaves |> Seq.length) == 2) "leaf expansion: changed stone -> 2 leaf dependants (prime, orange)"
+assert (stoneLeaves |> Seq.contains "prime/Arquidev.Prime.Test/Arquidev.Prime.Test.csproj")
+    "leaf expansion: stone -> prime"
+assert (stoneLeaves |> Seq.contains "orange/Arquidev.Orange.Test/Arquidev.Orange.Test.csproj")
+    "leaf expansion: stone -> orange"
+
+let primeLeaves = within cd fixture
+    Sln.findLeafDependants (Sln.makeDependencyTree "Arquidev.Test.sln") Dotnet.isPublishable "prime/Arquidev.Prime.Test/Arquidev.Prime.Test.csproj"
+    |> Seq.freeze
+assert ((primeLeaves |> Seq.length) == 1) "leaf expansion: changed prime -> itself only (a leaf)"
+
+// --- 5. isPublishable / isPackable / isTest on the real csprojs ---
+let pub = isLeaf "prime/Arquidev.Prime.Test/Arquidev.Prime.Test.csproj"
+let stonePub = within cd fixture (Dotnet.isPublishable "stone/Arquidev.Stone.Pkg/Arquidev.Stone.Pkg.csproj")
+let stonePack = within cd fixture (Dotnet.isPackable "stone/Arquidev.Stone.Pkg/Arquidev.Stone.Pkg.csproj")
+assert pub "isPublishable: prime is publishable"
+assert (not stonePub) "isPublishable: stone is NOT publishable"
+assert stonePack "isPackable: stone is packable"
+
+print "== all sln asserts passed =="
+print "SLN HARNESS ALL GREEN"

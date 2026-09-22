@@ -520,3 +520,215 @@ Selector.extend, and does the snapshot write/validate round-trip and the
 github CI logic + deploy-spec. test/harness2-tekton.weir — the tekton CI
 logic + filter + deploy-spec (separate file per gap 1). Both green; every
 assert is exit-code (fail -> exit 1).
+═══════════════════════════════════════════════════════════════════════════
+STAGE 2.5 — .sln parsing, the solution dependency graph, and the
+snapshot-validation harness against the real arquidevio/test-dbt fixture
+═══════════════════════════════════════════════════════════════════════════
+
+Scope delivered: a weir-native classic `.sln` parser (lib/sln.weir), the
+solution ProjectReference dependency graph + reverse-reachability leaf walk
+(Solution.makeDependencyTree / findLeafDependants / findAllLeafDependants),
+the dotnet `default` selector wired to that graph (required_when
+isPublishable + leaf-dependant expansion, mirroring test-dbt/plan.fsx), and a
+full snapshot-validation harness that runs the PORT against ALL 121 of dbt's
+golden snapshots in the fixture repo.
+
+HEADLINE RESULT: **121/121 golden snapshots pass** — bicep 33/33, default
+88/88. This is the first REAL cross-check of the port against dbt's own
+recorded output (Stage-1 was an fsy oracle over a synthetic fixture; Stage-2
+was structural). Every `.weir` checks clean, zero warnings, on weir
+0.0.0-dev+27eba9d.
+
+───────────────────────────────────────────────────────────────────────────
+THE FOUR PIECES
+───────────────────────────────────────────────────────────────────────────
+
+1. lib/sln.weir — the `.sln` parser (STATUS: done, snapshot-validated)
+
+   Modelled on dotnet/solution.fsx. dbt uses Ionide.ProjInfo's tryParseSln
+   for the bespoke `.sln` text format; the port owns the parse with a
+   deterministic regex over each line (the yaml-subset playbook — never
+   hand-write a parser, read the format's own grammar):
+
+     File.read sln
+     |> Seq.collect (Str.rmatchAll @"Project\(""\{[^}]+\}""\) = ""([^""]+)"",
+                                   ""([^""]+)"", ""\{([^}]+)\}""")
+     -> (name, path, guid) per project row
+
+   `\`→`/` normalised, joined against the .sln's dir, Path.normalize'd, and
+   filtered to `.csproj`/`.fsproj` — which drops the 5 solution-FOLDER rows
+   (their path is a bare folder name with no extension), keeping exactly the
+   3 real projects. Verified against the fixture's Arquidev.Test.sln:
+   prime, orange, stone, repo-relative. The Global/config tail never matches
+   the Project(...) line pattern, so no explicit "stop at Global" is needed.
+
+2. The solution dependency graph (STATUS: done, snapshot-validated)
+
+   Solution.makeDependencyTree ports 1:1: for each project, read its
+   `<ProjectReference Include="…"/>` targets via `from xml` (the Stage-1
+   csproj win, verbatim — a typed XML boundary, no XPath string), emit
+   (referenced -> referrer) pairs, group by referenced. So the graph is the
+   REVERSE dependency graph, keyed by the depended-upon project.
+
+   findLeafDependants IS `Graph.reach` over that reverse graph — the FIFTH
+   port to watch a graph builtin eat a hand-rolled visited-Set recursion.
+   dbt's recursion is:
+       find proj: if tree.ContainsKey(proj) && not (isLeaf proj)
+                  then recurse into referrers else yield proj
+   The weir shape: Graph.reach where a LEAF node exposes NO neighbours (the
+   walk halts there), then `Seq.where isLeaf`. A non-leaf dead-end is reached
+   but filtered out — and it would be dropped downstream by isRequired
+   regardless (required == isLeaf here), so the leaf-only filter is exactly
+   faithful to dbt's `proj :: sofar` yield. findAllLeafDependants is the same
+   with leaves keeping their neighbours (walk continues past every leaf) —
+   the nuget selector's variant. Verified on the real graph:
+       stone (not publishable, referenced by prime+orange)
+         -> {prime, orange}   (2 leaf dependants)
+       prime (publishable, a leaf)  -> {prime}   (itself only)
+   Matches the golden snapshots' required-project sets bit for bit, incl. a
+   9-required multi-hop bicep chain.
+
+3. The dotnet `default` selector + isPublishable (STATUS: done, validated)
+
+   isPublishable/isPackable/isTest were already ported in Stage 1 (from xml
+   over PropertyGroup, present-or-absent Option<string> == "true"). Stage-2.5
+   adds the leaf expansion and the `default` selector:
+
+     Dotnet.expandWith walk isLeaf ctx =
+       let tree = Sln.makeDependencyTree (Sln.findInDir ".")
+       walk tree isLeaf ctx.projectPath
+
+     Dotnet.default = { id="dotnet"; patterns=["*.*sproj"];
+                        isRequired = isPublishable; isIgnored = isTest;
+                        expandLeafs = expandWith findLeafDependants isPublishable }
+
+   This mirrors test-dbt/plan.fsx's default profile (`required_when
+   DotnetProject.isPublishable; extend selector.defaults.dotnet.generic`).
+   `image` = `default` (same shape); `nuget` uses findAllLeafDependants +
+   isPackable (ported for completeness; 0 snapshots to validate it).
+
+   THE ONE NON-OBVIOUS SEMANTIC dbt encodes: the generic selector's
+   expand_leafs uses `ctx.selector.isRequired` as the LEAF test, so an
+   `extend`-ing selector's `required_when` reaches back into the expansion.
+   weir's LeafContext carries no selector (unlike dbt's), so the port THREADS
+   the leaf predicate explicitly — `expandWith walk isLeaf` — and pins it to
+   isPublishable at the `default` selector. Cleaner and more honest than the
+   implicit selector-in-context back-reference.
+
+4. The snapshot-validation harness (STATUS: done — 121/121)
+
+   test/snapshots.weir (+ test/snapshots.sh wrapper). For every
+   `.dbt-<profile>-<base>-<cur>.snapshot.json` in the fixture's
+   dbt-snapshots/:
+     - profile from the FILENAME (default | bicep);
+     - base/cur commit from the golden JSON (baseCommits[0] / currentCommit);
+     - run bin/plan-eval.weir in Diff mode (DBT_MODE=diff + the three DBT_*
+       vars via an Env.ofPairs overlay sigil, cwd = the fixture) capturing
+       its one-line snapshot JSON;
+     - canonicalise the golden through the SAME `from json SnapshotRecord |>
+       to json` path (identical field order + key/seq sorting), so equal
+       snapshots are byte-identical text — the comparison currency the
+       snapshot module already uses on disk;
+     - string-compare; tally per profile; fail on any divergence.
+
+   bin/plan-eval.weir is the plan definition that mirrors test-dbt/plan.fsx's
+   `default` + `bicep` profiles (nuget SKIPPED — 0 snapshots). It projects
+   PlanOutput -> Snapshot.toRecord -> `to json`, which is byte-exact the
+   on-disk snapshot shape dbt writes.
+
+   Result:  bicep: 33/33   default: 88/88   TOTAL: 121/121   (deterministic
+   across repeated runs; ~6.5s for the 121-subprocess sweep).
+
+───────────────────────────────────────────────────────────────────────────
+DIVERGENCES FOUND AND FIXED (each a real finding, none papered over)
+───────────────────────────────────────────────────────────────────────────
+
+D1. currentCommit is stored VERBATIM, base is rev-parsed. (fidelity, not a
+    bug — informs the harness.) git-diff.fsx dirsFromDiff sets
+    `currentCommit = toRef` UNCHANGED (rev-parse HEAD only when toRef=None),
+    while the base goes through resolveBaseRefs -> `git rev-parse` -> full
+    SHA. So the golden JSON stores the FULL current SHA it was fed and a
+    rev-parsed full base SHA, even though the FILENAME carries 7-char hashes.
+    The harness therefore feeds the golden's OWN full commits (from the JSON,
+    not the filename) — currentCommit then matches verbatim and the base
+    rev-parses back to the same full SHA. The port already matched dbt here;
+    this only shaped how the harness sources its commits. First observed as a
+    single-field mismatch (short `491b531` vs full `491b531ee9…`), root-caused
+    to the filename-vs-JSON hash difference, resolved by sourcing commits from
+    the JSON.
+
+D2. Sln.findInDir returned an ABSOLUTE path -> graph keys didn't match
+    discovery. (real port bug, fixed.) Dir.list yields absolute paths, so the
+    first cut of findInDir produced `/tmp/test-dbt/Arquidev.Test.sln`, making
+    every tree key absolute (`/tmp/test-dbt/stone/…`) while discovery
+    addresses projects repo-relative (`stone/…`). Leaf expansion then found
+    ZERO dependants (key mismatch) — the default profile returned empty
+    requiredProjects for every stone-change case. FIX: findInDir returns the
+    solution path JOINED against `dir` as given (`Path.combine dir
+    (Path.fileName p)`), so findInDir "." yields `./Arquidev.Test.sln` and
+    the whole graph stays repo-relative, matching discovery. dbt uses
+    absolutes end-to-end and is internally consistent; the port is
+    internally consistent the other way (relative), because discovery is
+    relative and git yields relative paths (Stage-1 (c)#5 already established
+    the port runs at repo root with relative paths).
+
+    No OTHER divergences: bicep (already ported Stage-2) and the whole
+    default-profile leaf-expansion story both hit 100% once D2 was fixed.
+
+───────────────────────────────────────────────────────────────────────────
+NEW weir gaps / notes hit in Stage 2.5
+───────────────────────────────────────────────────────────────────────────
+
+G1. `pwd` is `seq<string>`, not `string`. Capturing the invocation cwd for
+    later path-absolutisation needs `pwd |> Seq.head`. Minor, but the type
+    surprises (bash muscle memory expects a scalar). No functional gap.
+
+G2. Imported types are BARE in the `from json`/adapter slot, QUALIFIED in
+    value construction — the same Stage-1 (c)#3/#4 asymmetry, now hit at
+    `from json SnapshotRecord` (NOT `Snapshot.SnapshotRecord`, which errors
+    with an explicit teach: "the adapter slot takes a bare record name …
+    imported types resolve by their plain name"). The error message is
+    excellent; noting it because it's the recurring module-boundary papercut.
+
+G3. `rec` is a reserved word — cannot bind `let rec = …` (tried it as a
+    short name for a record; renamed to `record`). Consistent with the
+    reserved-word law; just a naming trap.
+
+G4. `xs |> Seq.length == N` needs parens: `(xs |> Seq.length) == N` (the
+    operator-binds-tighter-than-pipe rule, already in the skill). Hit it in
+    the sln unit harness asserts; the check error names the exact fix.
+
+    NO new gaps in the load-bearing areas the task flagged as risk: the
+    regex/text-parse of `.sln` (Str.rmatchAll — clean, deterministic, first
+    try), reading csproj `<ProjectReference>` (from xml — first try, exactly
+    like Stage-1's PropertyGroup), and the JSON-shape match (`to json` field
+    order = declaration order, Map keys key-sorted, so the canonical-JSON
+    string compare is byte-exact against dbt's pretty-printed golden once
+    normalised through the same read+write). The snapshot module's Stage-2
+    canonical-JSON comparison design (Stage-2 FINDINGS) paid off directly:
+    it's the exact currency this harness needs.
+
+───────────────────────────────────────────────────────────────────────────
+HOW IT READ vs THE F#
+───────────────────────────────────────────────────────────────────────────
+
+The `.sln` parser is SHORTER and clearer than dbt's Ionide.ProjInfo
+dependency: one regex + a filter vs a whole library + a SolutionItem match
+tree (dbt recurses over MSBuildFormat/Folder/Unsupported/Unknown item kinds;
+the port just filters paths by extension). The dependency graph is the
+Stage-1/2 story again — Graph.reach over the reverse graph replaces dbt's two
+hand-written visited-Set recursions (findLeafDependants /
+findAllLeafDependants), and the "halt at leaves vs collect all leaves"
+distinction that dbt encodes with two nearly-identical `let rec find`s
+becomes a one-line difference in the neighbour function (a leaf exposes no
+neighbours, or it does). from xml on the csproj `<ProjectReference>` is the
+csproj win a third time. The genuinely new insight: dbt's implicit
+selector-in-LeafContext back-reference (expand_leafs reading
+ctx.selector.isRequired) is spelled explicitly in weir as a threaded
+predicate — the port makes the data-flow visible instead of hiding it in the
+context record.
+
+Verdict: Stage 2.5 is the strongest evidence yet that the port is faithful —
+121 independent golden snapshots, generated by the REAL dbt over a REAL
+multi-project/multi-bicep monorepo with transitive dependencies, all match
+the port's output exactly.

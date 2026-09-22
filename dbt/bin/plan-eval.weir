@@ -1,0 +1,61 @@
+#!/usr/bin/env weir
+
+// plan-eval — the snapshot-validation entry: mirror test-dbt/plan.fsx's
+// profiles (default + bicep; nuget skipped — the fixture has 0 nuget
+// snapshots), evaluate the PORT's plan for the (profile, range) named by the
+// environment, and emit the snapshot JSON shape on stdout for the harness to
+// diff against dbt's golden.
+//
+// It reads DBT_PROFILE / DBT_BASE_COMMIT / DBT_CURRENT_COMMIT (DBT_MODE=diff),
+// runs Plan.evaluate at the repo root (cwd = the fixture), projects the
+// PlanOutput to the canonical SnapshotRecord (Snapshot.toRecord — sorted base
+// commits, sorted per-dir files, projects sorted by relativePath), and writes
+// its JSON. Serialisation is byte-for-byte the snapshot shape dbt writes.
+
+import "./../lib/types.weir" as T
+import "./../lib/plan.weir" as Dbt
+import "./../lib/dotnet.weir" as Dotnet
+import "./../lib/bicep.weir" as Bicep
+import "./../lib/selector.weir" as Selector
+import "./../lib/snapshot.weir" as Snapshot
+
+// test-dbt/plan.fsx: the DEFAULT profile — the dotnet selector with
+// required_when isPublishable + leaf-dependant expansion (Dotnet.default),
+// scraping change keys.
+let defaultProfile = T.Profile {
+    id = "default"
+    includeRootDir = false
+    changeKeyRegex = Some @"(CHANGE-KEY-[a-z0-9]+)"
+    selector = Dotnet.default
+}
+
+// test-dbt/plan.fsx: the BICEP profile — `discovery_root "bicep"; extend
+// selector.defaults.bicep.generic`. The port sets discoveryRoot = Some "bicep"
+// on the bicep generic selector.
+let bicepSelector =
+    Selector.extend Bicep.generic {
+        Selector.noOverrides with discoveryRoot = Some "bicep"
+    }
+
+let bicepProfile = T.Profile {
+    id = "bicep"
+    includeRootDir = false
+    changeKeyRegex = None
+    selector = bicepSelector
+}
+
+let buildPlan = T.BuildPlan {
+    profiles = Map.ofPairs [
+        ("default", defaultProfile)
+        ("bicep", bicepProfile)
+    ]
+    range = None
+}
+
+let env = Env.load DbtEnv
+let out = Dbt.evaluate env buildPlan
+
+// Project to the canonical snapshot record and emit its JSON (the exact
+// on-disk snapshot shape). One document on stdout.
+let record = Snapshot.toRecord out
+record |> to json |> Seq.iter print

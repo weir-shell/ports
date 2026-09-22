@@ -1,0 +1,149 @@
+#!/usr/bin/env weir
+
+// The snapshot-validation harness: run the PORT's plan against the real
+// arquidevio/test-dbt fixture for every one of dbt's 121 golden snapshots,
+// and compare.
+//
+// For each `.dbt-<profile>-<base>-<cur>.snapshot.json` under the fixture's
+// dbt-snapshots/:
+//   - profile comes from the FILENAME (default | bicep);
+//   - base/cur commit come from the golden JSON (baseCommits[0] /
+//     currentCommit) — the FULL SHAs, which dbt stores VERBATIM (dbt does not
+//     rev-parse the current commit, and rev-parses the base back to the same
+//     full SHA), so feeding the golden's own commits makes the range faithful;
+//   - the port runs in Diff mode (DBT_MODE=diff + the three DBT_* vars, cwd =
+//     the fixture) and emits its canonical snapshot JSON on stdout;
+//   - the golden is canonicalised through the SAME `from json SnapshotRecord |>
+//     to json` path (identical field order + key/seq sorting), so equal
+//     snapshots are byte-identical text — the comparison currency the port's
+//     snapshot module already uses on disk.
+//
+// Reports passed/total overall and per profile; a divergence prints the
+// first differing case with both canonical forms. Exit 1 on any mismatch.
+//
+// Usage: weir test/snapshots.weir <fixture-dir> <plan-eval.weir path>
+// (defaults: /tmp/test-dbt and the sibling ../bin/plan-eval.weir).
+
+import "./../lib/snapshot.weir" as Snapshot
+
+let args = Self.args |> Seq.freeze
+
+// Resolve both paths to ABSOLUTE against the invocation cwd BEFORE any `cd`:
+// runCase enters the fixture dir to run the port, so a relative plan-eval or
+// fixture path would break there.
+let startCwd = pwd |> Seq.head
+
+let absolutize p =
+    if Str.startsWith "/" p then p else Path.combine startCwd p |> Path.normalize
+
+let fixtureDir = args |> Seq.tryHead |> Option.defaultValue "/tmp/test-dbt" |> absolutize
+let planEval =
+    args
+    |> Seq.tryItem 1
+    |> Option.map absolutize
+    |> Option.defaultValue (Path.combine (Path.dir (Path.dir Self.scriptPath)) "bin/plan-eval.weir")
+
+let snapshotsDir = Path.combine fixtureDir "dbt-snapshots"
+
+/// The profile from a snapshot filename: `.dbt-<profile>-<base>-<cur>...`.
+let profileOf name =
+    match Str.rmatch @"\.dbt-([a-z]+)-" name with
+    | Some g -> g |> Seq.head
+    | None -> fail $"cannot read profile from {name}"
+
+/// Canonicalise a golden snapshot file through the port's own record type —
+/// the comparison currency. Reading then re-writing normalises key/seq order
+/// to exactly what the port emits, so equal snapshots are byte-identical.
+let canonicalGolden path =
+    File.read path
+    |> from json SnapshotRecord
+    |> to json
+    |> Seq.freeze
+    |> Str.join "\n"
+
+// Every golden snapshot file (full paths), sorted.
+let goldenFiles =
+    Path.glob $"{snapshotsDir}/.dbt-*.snapshot.json"
+    |> Seq.freeze
+
+let total = goldenFiles |> Seq.length
+print $"Running {total} golden snapshots from {snapshotsDir}"
+
+// One case's outcome.
+type CaseResult = {
+    profile: string
+    ok: bool
+    got: string
+    gold: string
+}
+
+// Run one case.
+let runCase path =
+    let golden = File.read path |> from json SnapshotRecord
+    let base = golden.changeSetRange |> Option.map (fun r -> r.baseCommits |> Seq.head) |> Option.defaultValue ""
+    let cur = golden.changeSetRange |> Option.map (fun r -> r.currentCommit) |> Option.defaultValue ""
+    let profile = profileOf (Path.fileName path)
+    let e = Env.ofPairs [
+        ("DBT_MODE", "diff")
+        ("DBT_PROFILE", profile)
+        ("DBT_BASE_COMMIT", base)
+        ("DBT_CURRENT_COMMIT", cur)
+    ]
+    // Run the port at the fixture root; capture its one-line JSON document.
+    let got =
+        within cd fixtureDir
+            $e(weir $planEval | complete) |> _.stdout |> Str.join "\n" |> Str.trim
+    let gold = canonicalGolden path
+    CaseResult { profile = profile; ok = got == gold; got = got; gold = gold }
+
+// Accumulate pass/fail counts per profile, and remember the first mismatch.
+type Tally = {
+    passed: int
+    failed: int
+    bicepPass: int
+    bicepTotal: int
+    defaultPass: int
+    defaultTotal: int
+    firstFail: Option<string>
+}
+
+let zero = Tally {
+    passed = 0
+    failed = 0
+    bicepPass = 0
+    bicepTotal = 0
+    defaultPass = 0
+    defaultTotal = 0
+    firstFail = None
+}
+
+let step acc path =
+    let r = runCase path
+    let name = Path.fileName path
+    if not r.ok && acc.firstFail == None then
+        printerr $"MISMATCH: {name}"
+        printerr $"  GOT : {r.got}"
+        printerr $"  GOLD: {r.gold}"
+    let bicepInc = if r.profile == "bicep" then 1 else 0
+    let defInc = if r.profile == "default" then 1 else 0
+    let okInc = if r.ok then 1 else 0
+    Tally {
+        passed = acc.passed + okInc
+        failed = acc.failed + (1 - okInc)
+        bicepTotal = acc.bicepTotal + bicepInc
+        bicepPass = acc.bicepPass + (bicepInc * okInc)
+        defaultTotal = acc.defaultTotal + defInc
+        defaultPass = acc.defaultPass + (defInc * okInc)
+        firstFail = if r.ok then acc.firstFail else Option.orElse (Some name) acc.firstFail
+    }
+
+let result = goldenFiles |> Seq.fold step zero
+
+print "=== SNAPSHOT RESULTS ==="
+print $"bicep:   {result.bicepPass}/{result.bicepTotal}"
+print $"default: {result.defaultPass}/{result.defaultTotal}"
+print $"TOTAL:   {result.passed}/{total}"
+
+if result.failed > 0 then
+    fail $"{result.failed} snapshot(s) diverged"
+print "ALL SNAPSHOTS PASSED"

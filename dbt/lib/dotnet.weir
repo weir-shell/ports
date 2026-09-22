@@ -5,13 +5,16 @@ module Dotnet
 // (IsPublishable/IsPackable/IsTestProject); weir reads csproj natively
 // with `from xml` — a genuine differentiator (the csproj IS the boundary).
 //
-// STAGE 1 SCOPE: only the `generic` selector is ported (pattern
-// "*.*sproj", ignore test projects). The image/nuget selectors and the
-// dependency-graph leaf expansion (solution.fsx makeDependencyTree /
-// findLeafDependants) are STUB-WITH-TEACH — expandLeafs returns the
-// project path unchanged (dbt's Selector.Default), so no .sln parsing.
+// STAGE 2.5: the dependency-graph leaf expansion (solution.fsx
+// makeDependencyTree / findLeafDependants) is now REAL — lib/sln.weir
+// parses the `.sln`, builds the reverse ProjectReference graph, and
+// expandLeafs walks it. `generic` keeps the identity expansion (dbt's
+// generic uses findLeafDependants; the `default` selector below wires it),
+// and `default` mirrors test-dbt/plan.fsx's default profile:
+// required_when isPublishable + the leaf-dependant expansion.
 
 import "./types.weir" as T
+import "./sln.weir" as Sln
 
 // A <PropertyGroup> may repeat; each carries the properties we probe as
 // optional text leaves (present-or-absent). `from xml` maps a field to
@@ -54,14 +57,47 @@ let isPackable : string -> bool
 let isPackable projPath =
     hasProperty (fun g -> g.IsPackable) projPath
 
+// --- Leaf expansion via the .sln dependency graph (project.fsx expandWith) ---
+
+/// dbt's `expandWith findDependants ctx`: build the dependency tree from the
+/// solution in cwd, then expand the changed project to its leaf dependants
+/// using the selector's `isRequired` as the leaf test. The port threads the
+/// leaf predicate explicitly (weir's LeafContext carries no selector, unlike
+/// dbt's), and takes the walk function (`Sln.findLeafDependants` for the
+/// generic/image selectors, `Sln.findAllLeafDependants` for nuget) as an
+/// argument — the two dbt `expandWith` instantiations.
+let expandWith : (Map<string, seq<string>> -> (string -> bool) -> string -> seq<string>) -> (string -> bool) -> LeafContext -> seq<string>
+
+let expandWith walk isLeaf ctx =
+    let slnPath = Sln.findInDir "."
+    let tree = Sln.makeDependencyTree slnPath
+    walk tree isLeaf ctx.projectPath
+
+/// Leaf expansion for the generic/default dotnet selectors (project.fsx
+/// `expand_leafs (expandWith Solution.findLeafDependants)`), with the leaf
+/// test = isPublishable (test-dbt/plan.fsx's default profile
+/// `required_when DotnetProject.isPublishable`).
+let expandLeafsPublishable : LeafContext -> seq<string>
+
+let expandLeafsPublishable ctx =
+    expandWith Sln.findLeafDependants isPublishable ctx
+
+/// Leaf expansion for the nuget selector (project.fsx `expand_leafs
+/// (expandWith Solution.findAllLeafDependants)`), leaf test = isPackable.
+let expandLeafsPackable : LeafContext -> seq<string>
+
+let expandLeafsPackable ctx =
+    expandWith Sln.findAllLeafDependants isPackable ctx
+
 /// The generic dotnet selector (project.fsx DotnetSelectors.generic):
 /// id "dotnet", pattern "*.*sproj", required_when always, ignored_when
-/// isTest. Leaf expansion is the default identity (Stage-1 stub — no
-/// solution dependency traversal).
+/// isTest, expand_leafs (expandWith findLeafDependants). Alone, its leaf
+/// test is `always true`, so expansion is effectively identity; the
+/// `default`/`image` selectors below narrow the leaf test to isPublishable.
 let generic : Selector
 
 let generic =
-    Selector {
+    T.Selector {
         id = "dotnet"
         patterns = ["*.*sproj"]
         excludePatterns = []
@@ -70,4 +106,49 @@ let generic =
         isIgnored = isTest
         projectId = fun p -> p.projectId
         expandLeafs = fun ctx -> [ctx.projectPath]
+    }
+
+/// The `default` dotnet selector — test-dbt/plan.fsx's default profile:
+/// `required_when DotnetProject.isPublishable; extend generic`. So it is the
+/// generic selector (id "dotnet", pattern "*.*sproj", ignored_when isTest)
+/// with `isRequired` narrowed to isPublishable and the leaf-dependant
+/// expansion wired to that same predicate. This is the selector the
+/// snapshot harness's `default` profile drives.
+let default : Selector
+
+let default =
+    T.Selector {
+        id = "dotnet"
+        patterns = ["*.*sproj"]
+        excludePatterns = []
+        discoveryRoot = None
+        isRequired = isPublishable
+        isIgnored = isTest
+        projectId = fun p -> p.projectId
+        expandLeafs = expandLeafsPublishable
+    }
+
+/// The `image` dotnet selector (project.fsx `image`): identical to `default`
+/// (required_when isPublishable; extend generic). dbt separates them by
+/// profile name; the selector shape is the same.
+let image : Selector
+
+let image = default
+
+/// The `nuget` dotnet selector (project.fsx `nuget`): required_when
+/// isPackable, extend generic, expand_leafs (expandWith findAllLeafDependants).
+/// The fixture has zero nuget snapshots, so this is ported for completeness
+/// but not snapshot-validated.
+let nuget : Selector
+
+let nuget =
+    T.Selector {
+        id = "dotnet"
+        patterns = ["*.*sproj"]
+        excludePatterns = []
+        discoveryRoot = None
+        isRequired = isPackable
+        isIgnored = isTest
+        projectId = fun p -> p.projectId
+        expandLeafs = expandLeafsPackable
     }
