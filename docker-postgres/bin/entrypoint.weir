@@ -1,0 +1,60 @@
+#!/usr/bin/env weir
+// postgres container entrypoint, ported from the official
+// docker-library/postgres `docker-entrypoint.sh`. The Stage-1 slice is
+// the two load-bearing halves: the FIRST-RUN bootstrap (initdb + role/db
+// creation against a throwaway local server) and THE HANDOFF —
+// `^$cmd $@args | exec`, which REPLACES weir with postgres so it runs as
+// the container's PID 1 and receives SIGTERM/SIGINT DIRECTLY.
+//
+// The bash original ends in `exec "$@"` after a gosu/step-down dance and
+// a signal-forwarding trap; weir's `exec` keeps the pid natively (execve,
+// not spawn), so postgres — not a shell wrapper — is what Docker signals.
+
+let args = Self.args |> Seq.freeze
+
+// the command Docker was told to run (the image's CMD); default
+// `postgres`, matching the upstream image's own default
+let cmd = args |> Seq.tryItem 0 |> Option.defaultValue "postgres"
+let cmdArgs = args |> Seq.skip 1 |> Seq.freeze
+
+// the POSTGRES_* contract the image documents; defaults match upstream
+let envOr name fallback =
+    Env.get name |> Option.defaultValue fallback
+
+let pgData = envOr "PGDATA" "/var/lib/postgresql/data"
+let dbUser = envOr "POSTGRES_USER" "postgres"
+let dbName = envOr "POSTGRES_DB" dbUser
+
+// an initialized cluster already has a PG_VERSION file — only bootstrap
+// the first time (the upstream `if [ -z "$DATABASE_ALREADY_EXISTS" ]`)
+let firstRun = not (File.exists (Path.combine pgData "PG_VERSION"))
+
+// the first-run bootstrap: initdb the cluster, then create the database
+// against a throwaway local-socket server (exactly the upstream sequence).
+// The upstream script does this as the postgres user via gosu; the Stage-1
+// slice assumes we already are it — and `exec` at the end makes the
+// step-down unnecessary for the final long-lived process.
+let bootstrap () =
+    print "entrypoint: initializing a fresh PGDATA"
+    initdb --username $dbUser --pgdata $pgData | orFail "initdb failed"
+
+    pg_ctl --pgdata $pgData -o "-c listen_addresses=''" -w start | orFail "temp server start failed"
+
+    if dbName <> "postgres" then
+        createdb --username $dbUser $dbName | orFail $"createdb {dbName} failed"
+
+    pg_ctl --pgdata $pgData -m fast -w stop | orFail "temp server stop failed"
+    print "entrypoint: bootstrap complete"
+
+if firstRun then
+    bootstrap ()
+
+if not firstRun then
+    print "entrypoint: PGDATA already initialized — skipping bootstrap"
+
+// THE HANDOFF: become postgres. `exec` replaces this weir process, so the
+// command inherits pid 1 and every container signal reaches it with no
+// forwarding layer. A dynamic head keeps it injection-safe; the splat
+// forwards Docker's argv verbatim. Nothing after this line runs.
+print $"entrypoint: exec {cmd} (pid handoff)"
+^$cmd $@cmdArgs | exec
