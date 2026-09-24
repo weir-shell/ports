@@ -29,12 +29,12 @@ let dbName = envOr "POSTGRES_DB" dbUser
 // the first time (the upstream `if [ -z "$DATABASE_ALREADY_EXISTS" ]`)
 let firstRun = not (File.exists (Path.combine pgData "PG_VERSION"))
 
-// the first-run bootstrap: initdb the cluster, then create the database
-// against a throwaway local-socket server (exactly the upstream sequence).
-// The upstream script does this as the postgres user via gosu; the Stage-1
+// the first-run bootstrap: initdb, then create the database against a
+// throwaway local-socket server (exactly the upstream sequence). The
+// upstream script runs this as the postgres user via gosu; the Stage-1
 // slice assumes we already are it — and `exec` at the end makes the
 // step-down unnecessary for the final long-lived process.
-let bootstrap () =
+if firstRun then
     print "entrypoint: initializing a fresh PGDATA"
     initdb --username $dbUser --pgdata $pgData | orFail "initdb failed"
 
@@ -45,11 +45,7 @@ let bootstrap () =
 
     pg_ctl --pgdata $pgData -m fast -w stop | orFail "temp server stop failed"
     print "entrypoint: bootstrap complete"
-
-if firstRun then
-    bootstrap ()
-
-if not firstRun then
+else
     print "entrypoint: PGDATA already initialized — skipping bootstrap"
 
 // THE HANDOFF: become postgres. `exec` replaces this weir process, so the

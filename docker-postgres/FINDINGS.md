@@ -42,15 +42,25 @@ bare `cmd | exec` statement is legal (no "computes a value and discards it"
   raises with a message on nonzero, so a failed `initdb` stops the
   entrypoint loudly rather than silently continuing to a broken `exec`.
 
-## Friction met
+## What this port also fixed: top-level `if/else`
 
-- **Top-level `if/else` block.** A statement-position `if … then <block>
-  else <block>` at the *top level* did not parse (`'else' is a keyword`,
-  the parser backtracks) — it works inside a function/expression body. The
-  slice uses two `if … then` statements (`if firstRun` / `if not firstRun`)
-  instead, which reads fine here but is a sharper edge than expected;
-  worth confirming whether the top-level block-`else` is intended to be
-  absent or is a gap.
+The first cut of the entrypoint hit a real parser gap: a statement-position
+`if … then <block> else <block>` at the *top level* did not parse
+(`'else' is a keyword`, backtrack) — it worked only inside a
+function/expression body. The root was the assembler: a col-0 `if` is its
+own logical statement, and the dedented `else` was treated as a new
+statement, so the parser hit a stray keyword. A col-0 `else`/`elif` now
+continues its `if` (the same col-0 continuation as a dedented
+`|`/`until`/`always`), so the natural entrypoint shape
+
+```weir
+if firstRun then
+    ...bootstrap...
+else
+    print "already initialized"
+```
+
+reads exactly as it should. (Fixed in v0.0.50, alongside `exec`.)
 
 ## Stage 2
 
