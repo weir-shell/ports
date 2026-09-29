@@ -3,10 +3,13 @@
 DESTROYED per runnable), report final states, and die by SIGINT.
 (kill -INT from outside a tty is a no-op for weir - measured; SIGTERM and
 tty Ctrl+C are the unwind paths. See FINDINGS.)"""
-import os, pty, signal, subprocess, sys, tempfile, time
+import os, pty, signal, subprocess, sys, tempfile, time, shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WEIR = "/tmp/weir-freeze2/.local/bin/weir"
+# resolve weir from PATH (test/run.sh puts the right one first — the local
+# freeze in dev, the CI-installed release in CI); $WEIR overrides. execv
+# needs an absolute path, so which() not a bare name.
+WEIR = os.environ.get("WEIR") or shutil.which("weir") or "/tmp/weir-freeze2/.local/bin/weir"
 sd = tempfile.mkdtemp()
 
 pid, fd = pty.fork()
