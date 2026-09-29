@@ -61,9 +61,9 @@ let parse slnPath =
     File.read slnPath
     |> Seq.collect (fun line -> Str.rmatchAll projectLinePattern line)
     |> Seq.map (fun g ->
-        let name = g |> Seq.head
-        let rawPath = g |> Seq.skip 1 |> Seq.head
-        let guid = g |> Seq.skip 2 |> Seq.head
+        let name = g[0]
+        let rawPath = g[1]
+        let guid = g[2]
         let relPath = rawPath |> Str.replace @"\" "/"
         let normPath = Path.combine dir relPath |> Path.normalize
         SlnProject { name = name; path = normPath; guid = guid })
