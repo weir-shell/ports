@@ -111,6 +111,15 @@ let cases = [
       oracle = ["which"; "subtool"] }
 ]
 
+// git cannot track empty dirs, so the asdf subtree import dropped every
+// empty fixture leaf; recreate them so the test is self-contained: the
+// deep .tool-versions-walk leaf, the version-install markers (2.0.0 and
+// ref-main, on-disk spelling of ref:main), and the empty-plug plugin dir
+Dir.create deepDir
+Dir.create (Path.combine dataDir "installs/dummy/2.0.0")
+Dir.create (Path.combine dataDir "installs/dummy/ref-main")
+Dir.create (Path.combine dataDir "plugins/empty-plug")
+
 // run every case; collect pass/fail
 let results =
     cases
