@@ -1,12 +1,15 @@
-// probe: within proc with env sigil in command position, Proc.wait code, Proc.tail
+// probe: within proc under a within-env overlay, Proc.wait code, Proc.tail.
+// The inline `$ev(...)` env sigil in the proc-command position was retired
+// after v0.0.46 — the overlay now comes from an enclosing `within env`.
 let ev = Env.ofPairs [("RING_PROBE", "42")]
 
-within proc child = $ev(sh -c "echo env is $RING_PROBE; sleep 0.3; exit 7")
-    poll timeout=5s interval=50ms
-        not (Proc.running child)
-    let code = Proc.wait child
-    let tail = Proc.tail child
-    print $"exit={code} tail={tail |> Str.join "/"}"
+within env ev
+    within proc child = sh -c "echo env is $RING_PROBE; sleep 0.3; exit 7"
+        poll timeout=5s interval=50ms
+            not (Proc.running child)
+        let code = Proc.wait child
+        let tail = Proc.tail child
+        print $"exit={code} tail={tail |> Str.join "/"}"
 
 // probe: within env around a scope
 within env ev
