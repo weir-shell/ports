@@ -196,7 +196,7 @@ let resolveUserPath path =
     // strings beginning with ~/ are shell-style home paths
     if path |> Str.startsWith "~/" then
         match Env.get "HOME" with
-        | Some h -> $"{h}/{path |> Str.sub 2 (Str.length path - 2)}"
+        | Some h -> $"{h}/{path[2..]}"
         | None -> path
     else path
 
@@ -231,7 +231,7 @@ let versionsFor rows plugin =
         |> Seq.map (fun v ->
             // parse_asdf_version_file resolves a leading path: prefix
             if v |> Str.startsWith "path:" then
-                $"path:{resolveUserPath (v |> Str.sub 5 (Str.length v - 5))}"
+                $"path:{resolveUserPath (v[5..])}"
             else v))
     |> Option.defaultValue []
 
@@ -316,7 +316,7 @@ let installedVersions plugin =
         |> Seq.where Dir.exists
         |> Seq.map (fun p ->
             let b = Path.fileName p
-            if b |> Str.startsWith "ref-" then $"ref:{b |> Str.sub 4 (Str.length b - 4)}"
+            if b |> Str.startsWith "ref-" then $"ref:{b[4..]}"
             else b)
     else []
 
