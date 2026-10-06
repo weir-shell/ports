@@ -62,9 +62,7 @@ let toOption : RunDiscovery -> Option<string>
 let toOption d =
     match d with
     | HeadSha commit -> Some commit
-    | NoneSuccessful -> None
-    | NoneFound -> None
-    | Skipped -> None
+    | NoneSuccessful | NoneFound | Skipped -> None
 
 /// A step is green if it succeeded or was skipped (last-success-sha.fsx's
 /// step predicate).
@@ -72,10 +70,8 @@ let stepGreen : Step -> bool
 
 let stepGreen step =
     match step.conclusion with
-    | Some "success" -> true
-    | Some "skipped" -> true
-    | Some _ -> false
-    | None -> false
+    | Some "success" | Some "skipped" -> true
+    | Some _ | None -> false
 
 /// A job is green if it has steps and all are green (empty steps = false).
 let jobGreen : Job -> bool

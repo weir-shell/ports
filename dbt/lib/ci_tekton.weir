@@ -56,9 +56,7 @@ let toOption : RunDiscovery -> Option<string>
 let toOption d =
     match d with
     | HeadSha commit -> Some commit
-    | NoneSuccessful -> None
-    | NoneFound -> None
-    | Skipped -> None
+    | NoneSuccessful | NoneFound | Skipped -> None
 
 /// A result's commit annotation (last-success-sha.fsx commitOf).
 let commitOf : TektonResult -> Option<string>

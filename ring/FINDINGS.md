@@ -70,13 +70,17 @@ In weir the same shape is *lexical*:
 ```weir
 within                                      // per-runnable scope
     within proc child = sh -c $line         // one process generation
-        within
-            ...health loop...
-        always
-            Life.fire s.life id Life.Stop   // StopAsync (+ compose stop)
+        ...health loop...
+    always
+        Life.fire s.life id Life.Stop       // StopAsync (+ compose stop)
 always
     Life.fire s.life id Life.Destroy        // DestroyAsync (+ compose down)
 ```
+
+(Since weir v0.0.64 any `within` kind takes a trailing `always`, run
+while the resource is still held — the process is alive in the Stop
+cleanup. Before, the generation needed a bare `within` nested inside the
+proc scope to attach it.)
 
 The inner `always` fires STOPPED per generation — which is exactly
 ring's behaviour (recovery emits RUNNABLE_STOPPED too); the outer fires
@@ -245,7 +249,9 @@ client-vs-terminal distinction the server story will reopen.
    command position takes "splices and env sigils like any command".
    The working spelling is nesting under `within env ev` — fine, and
    the assembly error for line-end `!ev` even teaches exactly that —
-   but either the parser or the sentence should move.
+   but either the parser or the sentence should move. (v0.0.64: the
+   `!ev(...)` spelling is gone; `within env ev` is the one way to run
+   under an overlay, `$ev(...)` to capture.)
 
 3. **No cross-iteration state in `retry`/`poll`.** Porting
    `ITrackRetries` (`ConsecutiveFailures++`) had nowhere to live:
