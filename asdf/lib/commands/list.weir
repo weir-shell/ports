@@ -30,7 +30,7 @@ let displayInstalled name =
         // and stars nothing; only a single-version preset ever stars. We
         // reproduce that quirk faithfully [FINDING: a bash accident].
         let current =
-            Core.findVersions name (pwd |> Seq.exactlyOne) |> _.versions |> Str.join " "
+            Core.findVersions name pwd |> _.versions |> Str.join " "
         for v in versions do
             let flag = if v == current then " *" else "  "
             print $"{flag}{v}"

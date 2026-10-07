@@ -296,7 +296,7 @@ let findVersions plugin startDir =
             | _ -> { versions = []; source = ""; found = false }
 
 let presetVersionFor plugin =
-    let r = findVersions plugin (pwd |> Seq.exactlyOne)
+    let r = findVersions plugin pwd
     r.versions |> Seq.tryHead
 
 // ---- install paths ----------------------------------------------------
@@ -392,7 +392,7 @@ let selectVersion shimName =
     let markers = shimVersions shimName |> Seq.freeze
     // the distinct plugins this shim serves, in first-seen order
     let plugins = markers |> Seq.map fst |> Seq.distinct
-    let startDir = pwd |> Seq.exactlyOne
+    let startDir = pwd
     // for each plugin, each of its SET versions; take the first pair the
     // shim actually carries a marker for (select_version's nested loop)
     plugins
