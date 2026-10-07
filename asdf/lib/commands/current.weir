@@ -17,7 +17,7 @@ let currentFor plugin =
     if not (Core.pluginExists plugin) then
         printerr $"No such plugin: {plugin}"
         exit 1
-    let r = Core.findVersions plugin (pwd |> Seq.exactlyOne)
+    let r = Core.findVersions plugin pwd
     let fullVersion = r.versions |> Str.join " "
     // any set version not installed?
     let notInstalled =

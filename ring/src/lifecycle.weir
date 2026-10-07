@@ -50,18 +50,10 @@ let transition : RState -> Trigger -> Next
 let transition s t =
     match (s, t) with
     | (Zero, Init) -> Goto Idle
-    | (Zero, NoOp) -> Stay
-    | (Zero, HcOk) -> Stay
-    | (Zero, HcUnhealthy) -> Stay
-    | (Zero, Stop) -> Stay
-    | (Zero, Destroy) -> Stay
-    | (Idle, Start) -> Goto Pending
-    | (Idle, InitFailure) -> Goto Pending
+    | (Zero, NoOp) | (Zero, HcOk) | (Zero, HcUnhealthy) | (Zero, Stop) | (Zero, Destroy) -> Stay
+    | (Idle, Start) | (Idle, InitFailure) -> Goto Pending
     | (Idle, Destroy) -> Goto Zero
-    | (Idle, HcUnhealthy) -> Stay
-    | (Idle, NoOp) -> Stay
-    | (Idle, HcOk) -> Stay
-    | (Idle, Stop) -> Stay
+    | (Idle, HcUnhealthy) | (Idle, NoOp) | (Idle, HcOk) | (Idle, Stop) -> Stay
     | (Pending, HealthLoop) -> Goto ProbingHealth
     | (Pending, Stop) -> Goto Idle
     | (ProbingHealth, HcOk) -> Goto Healthy
@@ -70,9 +62,7 @@ let transition s t =
     | (ProbingHealth, Stop) -> Goto Idle
     | (ProbingHealth, NoOp) -> Stay
     | (Healthy, HealthLoop) -> Goto ProbingHealth
-    | (Healthy, Stop) -> Goto Idle
-    | (Dead, Stop) -> Goto Idle
-    | (Recovering, Stop) -> Goto Idle
+    | (Healthy, Stop) | (Dead, Stop) | (Recovering, Stop) -> Goto Idle
     | _ -> Refused
 
 /// protocol event pushed on a trigger (Queil.Ring.Protocol M enum names)
@@ -88,8 +78,7 @@ let eventOf t =
     | HcDead -> Some "RUNNABLE_UNRECOVERABLE"
     | Stop -> Some "RUNNABLE_STOPPED"
     | Destroy -> Some "RUNNABLE_DESTROYED"
-    | InitFailure -> None
-    | NoOp -> None
+    | InitFailure | NoOp -> None
 
 let parseState : string -> RState
 
@@ -148,7 +137,7 @@ let clock () =
 
 let logEvent ctx id ev fromS toS =
     within lock (Path.combine ctx.stateDir "log.lock") timeout=30s
-        File.append (eventsFile ctx) [$"{show (Instant.now ())} {id} {ev} {show fromS}->{show toS}"]
+        File.append (eventsFile ctx) [$"{Instant.now ()} {id} {ev} {fromS}->{toS}"]
 
 let fromWasHealthy prev =
     match prev with
@@ -184,4 +173,4 @@ let fire ctx id trig =
         | Some ev ->
             logEvent ctx id ev cur next
             if shouldPrint ev prev then
-                print $"{clock ()} {pad 12 id} {pad 24 ev} {show cur} -> {show next}"
+                print $"{clock ()} {pad 12 id} {pad 24 ev} {cur} -> {next}"

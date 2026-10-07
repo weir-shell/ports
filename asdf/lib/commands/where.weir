@@ -21,7 +21,7 @@ if not (Core.pluginExists plugin) then
 // resolve the version: given arg wins, else find_versions' first version
 let version =
     if fullVersion == "" then
-        Core.findVersions plugin (pwd |> Seq.exactlyOne) |> _.versions |> Seq.tryHead |> Option.defaultValue ""
+        Core.findVersions plugin pwd |> _.versions |> Seq.tryHead |> Option.defaultValue ""
     else
         // a given version: ref: keeps its type; else the bare token
         match Core.specOf fullVersion with

@@ -106,26 +106,25 @@ let procGeneration s id p =
     let argv = p.args |> Option.defaultValue []
     within cd (p.workingDir |> Option.defaultValue ".")
         within proc child = ^$cmd $@argv
-            within
-                Duration.sleep s.period
-                let budget = (s.deadline - Instant.now ()) + 60s
-                poll { Poll.defaults with timeout = budget; interval = s.period }
-                    tickProc s id child
-                match Life.stateOf s.life id with
-                | Dead ->
+            Duration.sleep s.period
+            let budget = (s.deadline - Instant.now ()) + 60s
+            poll { Poll.defaults with timeout = budget; interval = s.period }
+                tickProc s id child
+            match Life.stateOf s.life id with
+            | Dead ->
+                writeVerdict s id "halt"
+            | _ ->
+                let died = not (Proc.running child)
+                if died then
+                    let code = Proc.wait child
+                    let last = Proc.tail child |> Seq.tryLast |> Option.defaultValue "<no output>"
+                    print $"           {Life.pad 12 id} exited (code {code}), last output: {last}"
+                if died && Instant.now () < s.deadline then
+                    writeVerdict s id "recover"
+                else
                     writeVerdict s id "halt"
-                | _ ->
-                    let died = not (Proc.running child)
-                    if died then
-                        let code = Proc.wait child
-                        let last = Proc.tail child |> Seq.tryLast |> Option.defaultValue "<no output>"
-                        print $"           {Life.pad 12 id} exited (code {show code}), last output: {last}"
-                    if died && Instant.now () < s.deadline then
-                        writeVerdict s id "recover"
-                    else
-                        writeVerdict s id "halt"
-            always
-                Life.fire s.life id Life.Stop
+        always
+            Life.fire s.life id Life.Stop
     readVerdict s id
 
 let superviseProc s p =
@@ -172,24 +171,23 @@ let superviseCompose s c =
     // refusal - the workspace still checks on a machine without it
     let dc = "docker-compose"
     let rmR = ^$dc -f $fp rm -f | complete
-    if rmR.exitCode <> 0 then printerr $"[{id}] docker-compose rm failed (exit {show rmR.exitCode})"
+    if rmR.exitCode <> 0 then printerr $"[{id}] docker-compose rm failed (exit {rmR.exitCode})"
     let pullR = ^$dc -f $fp pull | complete
-    if pullR.exitCode <> 0 then printerr $"[{id}] docker-compose pull failed (exit {show pullR.exitCode})"
+    if pullR.exitCode <> 0 then printerr $"[{id}] docker-compose pull failed (exit {pullR.exitCode})"
     Life.fire s.life id Life.Init
     within
         Life.fire s.life id Life.Start
         within proc child = ^$dc -f $fp up --force-recreate
-            within
-                Duration.sleep s.period
-                let budget = (s.deadline - Instant.now ()) + 60s
-                poll { Poll.defaults with timeout = budget; interval = s.period }
-                    tickCompose s id child
-            always
-                Life.fire s.life id Life.Stop
-                // best-effort teardown: compose stop failure is tolerated -
-                // the down below still runs and the child is already reaped
-                let _stopR = ^$dc -f $fp stop | complete
-                ()
+            Duration.sleep s.period
+            let budget = (s.deadline - Instant.now ()) + 60s
+            poll { Poll.defaults with timeout = budget; interval = s.period }
+                tickCompose s id child
+        always
+            Life.fire s.life id Life.Stop
+            // best-effort teardown: compose stop failure is tolerated -
+            // the down below still runs and the child is already reaped
+            let _stopR = ^$dc -f $fp stop | complete
+            ()
     always
         // best-effort teardown: compose down failure is tolerated - nothing
         // downstream depends on it and Destroy must still fire
@@ -223,7 +221,7 @@ let report s ids =
     ids
         |> Seq.iter (fun id ->
             let st = Life.stateOf s.life id
-            print $"{Life.pad 16 id} {Life.protoStateOf st} (recoveries: {show (readRecs s id)})")
+            print $"{Life.pad 16 id} {Life.protoStateOf st} (recoveries: {readRecs s id})")
     print "WORKSPACE_STOPPED"
 
 let doRun a deadline =
@@ -245,16 +243,14 @@ let doRun a deadline =
     }
     let rd = if loaded.rootDir == "" then "." else loaded.rootDir
     within cd rd
-        within
-            loaded.runnables
-                |> Seq.piter (fun r ->
-                    match r with
-                    | Proc p -> superviseProc s p
-                    | DockerCompose c -> superviseCompose s c
-                    | Dotnet _ -> stubTeach r
-                    | Kustomize _ -> stubTeach r)
-        always
-            report s ids
+        loaded.runnables
+            |> Seq.piter (fun r ->
+                match r with
+                | Proc p -> superviseProc s p
+                | DockerCompose c -> superviseCompose s c
+                | Dotnet _ | Kustomize _ -> stubTeach r)
+    always
+        report s ids
     print "SERVER_SHUTDOWN"
 
 // ---- list ----

@@ -31,7 +31,7 @@ let args = Self.args |> Seq.freeze
 // Resolve both paths to ABSOLUTE against the invocation cwd BEFORE any `cd`:
 // runCase enters the fixture dir to run the port, so a relative plan-eval or
 // fixture path would break there.
-let startCwd = pwd |> Seq.head
+let startCwd = pwd
 
 let absolutize p =
     if Str.startsWith "/" p then p else Path.combine startCwd p |> Path.normalize
