@@ -1,0 +1,283 @@
+#!/usr/bin/env weir
+// module oracle: render single modules with the real starship
+// (`starship module <name>`) and with the port (in-process), byte for byte.
+//
+// - every module with detect_* defaults gets a fixture holding its first
+//   marker (taken from the vendored config schema — the same source as
+//   lib/config.weir), rendered with no config and with the module styled
+// - git scenarios: clean, dirty with every change kind, stash, detached, tag,
+//   ahead/behind, merge conflict, rebase
+// - env/file-driven modules under a fake HOME
+// - status/character across exit codes
+//
+// Needs a reference binary: --starship <path>.
+
+import "../starship.weir" as Ship
+import "../lib/ctx.weir" as X
+import "../lib/fmt.weir" as F
+
+type Cli = {
+    /// the reference starship binary
+    starship: string
+}
+
+type Case = {
+    label: string
+    name: string
+    dir: string
+    config: string
+    status: int
+    env: seq<string * string>
+}
+
+let cli = Args.load Cli
+let root = Self.scriptPath |> Path.dir |> Path.dir
+let schemaPath = Path.combine root ".weir/schemas/starship.json"
+
+let schema = File.read schemaPath |> from json {| properties: seq<string * {| default: Option<Yaml> |}> |}
+
+let strings y =
+    match y with
+    | Some (YSeq xs) -> xs |> Seq.choose (function | YStr s -> Some s | _ -> None) |> Seq.freeze
+    | _ -> []
+
+let field k y =
+    match y with
+    | Some (YMap kvs) -> kvs |> Seq.tryFind (fun (n, _) -> n == k) |> Option.map snd
+    | _ -> None
+
+// (module, first positive marker, is-folder)
+let markers =
+    schema.properties
+    |> Seq.choose (fun (name, p) ->
+        let d = p.default
+        let firstPos xs = xs |> Seq.tryFind (fun x -> not (Str.startsWith "!" x))
+        let disabledByDefault =
+            match field "disabled" d with
+            | Some (YBool b) -> b
+            | _ -> false
+        if disabledByDefault then None
+        else
+            match (firstPos (strings (field "detect_files" d)), firstPos (strings (field "detect_extensions" d)), firstPos (strings (field "detect_folders" d))) with
+            | (Some f, _, _) -> Some (name, f, false)
+            | (None, Some e, _) -> Some (name, $"main.{e}", false)
+            | (None, None, Some dir) -> Some (name, dir, true)
+            | _ -> None)
+    |> Seq.freeze
+
+let gitc = ["-c"; "user.name=t"; "-c"; "user.email=t@t"; "-c"; "init.defaultBranch=main"; "-c"; "commit.gpgsign=false"]
+
+let oracle c =
+    let conf = c.config
+    let here = c.dir
+    let st = $"{c.status}"
+    let pairs = c.env |> Seq.map (fun (k, v) -> Env.pair k v) |> Seq.freeze
+    within cd here
+        within env pairs
+            within env STARSHIP_CONFIG=$conf PWD=$here COLUMNS="80"
+                let r = ^$cli.starship module $c.name --status $st | complete
+                r.stdout |> Str.join "\n"
+
+let port c =
+    let pairs = c.env |> Seq.map (fun (k, v) -> Env.pair k v) |> Seq.freeze
+    within cd c.dir
+        within env pairs
+            let ctx = X.make (X.loadConfig c.config) c.dir (c.status == 0) (if c.status == 0 then None else Some c.status)
+            Ship.runModule ctx [c.name] c.name |> F.paint ctx.color ctx.palette 80 |> Str.join "\n"
+
+within tmp d
+    let fx p = Path.combine d p
+    let cfg name lines =
+        let p = fx $"{name}.toml"
+        lines |> File.write p
+        p
+    let empty = cfg "empty" [""]
+    let base = { label = ""; name = ""; dir = d; config = empty; status = 0; env = [] }
+
+    // ---- detection fixtures, one dir per module -------------------------
+    let langCases =
+        markers
+        |> Seq.collect (fun (name, marker, isDir) ->
+            let dir = fx $"lang-{name}"
+            Dir.create dir
+            if isDir then Dir.create (Path.combine dir marker) else ["x"] |> File.write (Path.combine dir marker)
+            let styled = cfg $"styled-{name}" [$"[{name}]"; "style = 'italic fg:#123456 bg:33'"; "symbol = '[S](underline) '"]
+            let plainCase = { base with label = $"{name} ({marker})"; name = name; dir = dir }
+            [plainCase; { plainCase with label = $"{name} styled"; config = styled }])
+        |> Seq.freeze
+
+    // ---- git scenarios -----------------------------------------------------
+    let remote = fx "remote.git"
+    git init -q --bare $remote
+    let repo = fx "repo"
+    Dir.create repo
+    within cd repo
+        git $@gitc init -q
+        ["a"] |> File.write "a.txt"
+        ["b"] |> File.write "b.txt"
+        ["c"] |> File.write "c.txt"
+        git $@gitc add -A
+        git $@gitc commit -qm one
+        git remote add origin $remote
+        git $@gitc push -q -u origin main
+        ["a2"] |> File.write "a.txt"
+        git add a.txt
+        git $@gitc commit -qm two
+        File.delete "b.txt"
+        ["c2"] |> File.write "c.txt"
+        git mv c.txt renamed.txt
+        ["n"] |> File.write "new.txt"
+        git add new.txt
+        ["u"] |> File.write "untracked.txt"
+        ["s"] |> File.write "a.txt"
+    let stash = fx "stash"
+    git $@gitc clone -q $repo $stash
+    within cd stash
+        ["s"] |> File.write "a.txt"
+        git $@gitc stash -q
+        ["t"] |> File.write "a.txt"
+        git $@gitc stash -q
+        git $@gitc tag v1.0
+        git $@gitc tag -a -m ann v1.1
+        git $@gitc checkout -q --detach HEAD
+    let conflict = fx "conflict"
+    git $@gitc clone -q $repo $conflict
+    within cd conflict
+        git $@gitc checkout -q -b side
+        ["side"] |> File.write "a.txt"
+        git $@gitc commit -qam side
+        git $@gitc checkout -q main
+        ["main"] |> File.write "a.txt"
+        git $@gitc commit -qam main
+        let _m = git $@gitc merge side | complete
+        print ()
+    let rebase = fx "rebase"
+    git $@gitc clone -q $repo $rebase
+    within cd rebase
+        git $@gitc checkout -q -b side
+        ["side"] |> File.write "a.txt"
+        git $@gitc commit -qam side
+        git $@gitc checkout -q main
+        ["main"] |> File.write "a.txt"
+        git $@gitc commit -qam main
+        git $@gitc checkout -q side
+        let _r = git $@gitc rebase main | complete
+        print ()
+    let gitMods = ["git_branch"; "git_commit"; "git_state"; "git_status"; "git_metrics"]
+    let gitCfg =
+        cfg "git" [
+            "[git_metrics]"
+            "disabled = false"
+            "[git_branch]"
+            "truncation_length = 3"
+            "always_show_remote = true"
+            "[git_commit]"
+            "only_detached = false"
+            "tag_disabled = false"
+            "[git_status]"
+            "format = '[$all_status$ahead_behind]($style)'"
+            "modified = 'M$count'"
+            "staged = 'S$count'"
+            "untracked = 'U$count'"
+            "stashed = 'st$count'"
+            "ahead = 'A$count'"
+            "behind = 'B$count'"
+        ]
+    let gitCases =
+        [repo; stash; conflict; rebase; Path.combine repo ".git"]
+        |> Seq.collect (fun dir ->
+            gitMods
+            |> Seq.collect (fun m ->
+                let c = { base with label = $"{m} @ {Path.fileName dir}"; name = m; dir = dir }
+                [c; { c with label = c.label + " cfg"; config = gitCfg }]))
+        |> Seq.freeze
+
+    // ---- directory -------------------------------------------------------
+    let deep = fx "home/u/projects/a/b/c/d"
+    Dir.create deep
+    let home = fx "home/u"
+    let dirCfg = cfg "dir" ["[directory]"; "truncation_length = 2"; "truncation_symbol = '…/'"; "home_symbol = 'H'"]
+    let fish = cfg "fish" ["[directory]"; "fish_style_pwd_dir_length = 1"; "truncate_to_repo = false"]
+    let subst = cfg "subst" ["[directory.substitutions]"; "'projects' = 'P'"]
+    let dirCases =
+        [
+            { base with label = "directory home"; name = "directory"; dir = home; env = [("HOME", home)] }
+            { base with label = "directory deep"; name = "directory"; dir = deep; env = [("HOME", home)] }
+            { base with label = "directory deep cfg"; name = "directory"; dir = deep; config = dirCfg; env = [("HOME", home)] }
+            { base with label = "directory fish"; name = "directory"; dir = deep; config = fish; env = [("HOME", home)] }
+            { base with label = "directory substitutions"; name = "directory"; dir = deep; config = subst; env = [("HOME", home)] }
+            { base with label = "directory repo subdir"; name = "directory"; dir = Path.combine repo ".git"; env = [("HOME", home)] }
+            { base with label = "directory /"; name = "directory"; dir = "/"; env = [("HOME", home)] }
+        ]
+
+    // ---- status / character -----------------------------------------------
+    let statusCfg = cfg "status" ["[status]"; "disabled = false"; "format = '[$symbol$status $common_meaning$signal_name$maybe_int]($style) '"]
+    let statusCases =
+        [0; 1; 2; 126; 127; 130; 137; 255]
+        |> Seq.collect (fun s ->
+            let c = { base with label = $"status {s}"; name = "status"; config = statusCfg; status = s }
+            [c; { c with label = $"character {s}"; name = "character"; config = empty }])
+        |> Seq.freeze
+
+    // ---- env- and file-driven modules under a fake HOME -------------------
+    let fh = fx "fakehome"
+    Dir.create (Path.combine fh ".aws")
+    ["[default]"; "region = us-east-1"; "[profile dev]"; "region = eu-west-2"] |> File.write (Path.combine fh ".aws/config")
+    ["[default]"; "aws_access_key_id = x"; "aws_secret_access_key = y"; "[dev]"; "aws_access_key_id = x"; "aws_secret_access_key = y"] |> File.write (Path.combine fh ".aws/credentials")
+    Dir.create (Path.combine fh ".kube")
+    [
+        "apiVersion: v1"
+        "kind: Config"
+        "current-context: prod"
+        "contexts:"
+        "- name: prod"
+        "  context:"
+        "    cluster: c1"
+        "    user: admin"
+        "    namespace: web"
+    ] |> File.write (Path.combine fh ".kube/config")
+    Dir.create (Path.combine fh ".docker")
+    ["{\"currentContext\": \"remote\"}"] |> File.write (Path.combine fh ".docker/config.json")
+    let pkg = fx "pkg"
+    Dir.create pkg
+    ["{\"name\": \"p\", \"version\": \"2.5.1\"}"] |> File.write (Path.combine pkg "package.json")
+    ["[package]"; "name = \"p\""; "version = \"0.9.0\""] |> File.write (Path.combine pkg "Cargo.toml")
+    let kubeOn = cfg "kube" ["[kubernetes]"; "disabled = false"]
+    let customs =
+        cfg "custom" [
+            "[custom.hello]"
+            "command = 'echo hello'"
+            "when = true"
+            "[custom.never]"
+            "command = 'echo never'"
+            "when = 'false'"
+            "[env_var.WEIR_ORACLE_VAR]"
+            "default = 'dflt'"
+        ]
+    let envCases =
+        [
+            { base with label = "aws profile"; name = "aws"; env = [("HOME", fh); ("AWS_PROFILE", "dev")] }
+            { base with label = "aws region"; name = "aws"; env = [("HOME", fh); ("AWS_REGION", "ap-south-1")] }
+            { base with label = "kubernetes"; name = "kubernetes"; config = kubeOn; env = [("HOME", fh)] }
+            { base with label = "docker_context"; name = "docker_context"; dir = pkg; env = [("HOME", fh)] }
+            { base with label = "docker_context env"; name = "docker_context"; dir = pkg; env = [("HOME", fh); ("DOCKER_CONTEXT", "ctx2")] }
+            { base with label = "conda"; name = "conda"; env = [("CONDA_DEFAULT_ENV", "science")] }
+            { base with label = "package"; name = "package"; dir = pkg }
+            { base with label = "username ssh"; name = "username"; env = [("SSH_CONNECTION", "1 2 3 4")] }
+            { base with label = "hostname ssh"; name = "hostname"; env = [("SSH_CONNECTION", "1 2 3 4")] }
+            { base with label = "shlvl"; name = "shlvl"; config = cfg "shlvl" ["[shlvl]"; "disabled = false"; "threshold = 1"]; env = [("SHLVL", "3")] }
+            { base with label = "custom.hello"; name = "custom.hello"; config = customs }
+            { base with label = "custom.never"; name = "custom.never"; config = customs }
+            { base with label = "env_var set"; name = "env_var.WEIR_ORACLE_VAR"; config = customs; env = [("WEIR_ORACLE_VAR", "val")] }
+            { base with label = "env_var default"; name = "env_var.WEIR_ORACLE_VAR"; config = customs }
+            { base with label = "nix_shell"; name = "nix_shell"; env = [("IN_NIX_SHELL", "pure"); ("name", "dev")] }
+            { base with label = "python venv"; name = "python"; dir = fx "lang-python"; env = [("VIRTUAL_ENV", "/x/venvs/proj")] }
+        ]
+
+    let cases = [langCases; gitCases; dirCases; statusCases; envCases] |> Seq.concat |> Seq.freeze
+    let results = cases |> Seq.pmapWith 8 (fun c -> (c.label, oracle c, port c)) |> Seq.freeze
+    let bad = results |> Seq.where (fun (_, w, g) -> w <> g) |> Seq.freeze
+    for (label, w, g) in bad do
+        printerr $"MISMATCH {label}\n  want {show w}\n  got  {show g}"
+    print $"module oracle: {Seq.length results - Seq.length bad}/{Seq.length results} match"
+    if not (Seq.isEmpty bad) then exit 1

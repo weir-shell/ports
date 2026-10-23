@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "artifacts": [
+    {
+      "kind": "schema",
+      "name": "starship",
+      "url": "https://raw.githubusercontent.com/starship/starship/master/.github/config-schema.json",
+      "sha256": "e50ce5f3e41e5c089b1074b174447650364797a4212d3e4ba8de628a8fae5ce2",
+      "path": "schemas/starship.json"
+    }
+  ]
+}

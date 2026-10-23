@@ -1,0 +1,872 @@
+module Cloud
+
+// cloud, container and environment modules (src/modules/<name>.rs):
+// aws azure gcloud openstack kubernetes docker_context nats pulumi conda
+// spack nix_shell guix_shell meson direnv mise singularity container netns
+// package. Mostly env vars and config files; INI files are read by a
+// line scan (no INI reader in weir).
+
+import "../config.weir" as C
+import "../fmt.weir" as F
+import "../ctx.weir" as X
+
+// ---- shared helpers ------------------------------------------------------------
+
+// row-generic: a config field when set, else the default
+let getOr cfg f d = cfg |> Option.bind f |> Option.defaultValue d
+
+let isDisabled cfg d = getOr cfg (fun c -> c.disabled) d
+
+let alias aliases v =
+    aliases |> Seq.tryFind (fun (k, _) -> k == v) |> Option.map snd |> Option.defaultValue v
+
+let env n = Env.get n
+
+let firstEnv names = names |> Seq.tryPick env
+
+let lift o = o |> Option.bind X.plain
+
+let homeOf ctx = ctx.home
+
+// utils/directory.rs truncate: the last `n` path components
+let truncatePath s n =
+    if n <= 0 then s
+    else
+        let parts = Str.split "/" s |> Seq.freeze
+        let comps = (if Str.startsWith "/" s then parts |> Seq.skip 1 else parts) |> Seq.freeze
+        let len = Seq.length comps
+        if len <= n then s else comps |> Seq.skip (len - n) |> Str.join "/"
+
+// utils/truncate.rs truncate_text (code points stand in for graphemes)
+let truncateText s n sym =
+    if n <= 0 then s
+    elif n < Str.length s then
+        let head = Str.sub 0 n s
+        let mark = if sym == "" then "" else Str.sub 0 1 sym
+        head + mark
+    else s
+
+// utils render_time without milliseconds
+let renderTime ms =
+    if ms < 1000 then "0s"
+    else
+        let secs = ms / 1000
+        let comps = [(secs / 86400, "d"); (secs / 3600 % 24, "h"); (secs / 60 % 60, "m"); (secs % 60, "s")]
+        comps
+        |> Seq.fold (fun acc (n, suffix) -> if n == 0 && acc == "" then acc else acc + $"{n}{suffix}") ""
+
+// INI as (section, key, value) rows; a section header is a row with key ""
+let ini text =
+    Str.split "\n" text
+    |> Seq.scan (fun (sec, _) raw ->
+        let line = Str.trim raw
+        match line with
+        | Regex @"^\[\s*(.*?)\s*\]" s -> (s, Some ("", ""))
+        | Regex @"^[;#]" () -> (sec, None)
+        | Regex @"^([^=:]+?)\s*[=:]\s*(.*)$" (k, v) -> (sec, Some (k, v))
+        | _ -> (sec, None)) ("", None)
+    |> Seq.choose (fun (sec, kv) -> kv |> Option.map (fun (k, v) -> (sec, k, v)))
+    |> Seq.freeze
+
+let readIni path = X.readFile path |> Option.map ini
+
+// a section's (key, value) pairs; None when the section is absent
+let section rows name =
+    let hits = rows |> Seq.where (fun (s, _, _) -> s == name) |> Seq.freeze
+    if Seq.isEmpty hits then None
+    else Some (hits |> Seq.where (fun (_, k, _) -> k <> "") |> Seq.map (fun (_, k, v) -> (k, v)) |> Seq.freeze)
+
+let iniGet props key = props |> Seq.tryFind (fun (k, _) -> k == key) |> Option.map snd
+
+let has props key = iniGet props key <> None
+
+let sha1Hex s = $(printf "%s" $s | sha1sum | line) |> try |> Option.map (fun l -> Str.fields l |> Seq.head)
+
+let bom = Bytes.fromHex "efbbbf" |> Str.fromUtf8
+
+let stripBom s = if Str.startsWith bom s then s[1..] else s
+
+let parseVersion vfmt raw =
+    let cleaned = Str.replace "\"" "" raw |> Str.trim |> Str.rmatch @"^v*(.*)$" |> Option.map (fun g -> g[0]) |> Option.defaultValue ""
+    X.version vfmt cleaned
+
+// a plain $symbol (direnv, mise map it as a value, not a meta format)
+let renderPlainSymbol fmt symbol style vars =
+    let lookup n = if n == "symbol" then X.plain symbol else vars n
+    F.render lookup (fun n -> if n == "style" then Some style else None) fmt
+
+// ---- aws ---------------------------------------------------------------------------
+
+let awsCredsPath ctx =
+    firstEnv ["AWS_SHARED_CREDENTIALS_FILE"; "AWS_CREDENTIALS_FILE"] |> Option.defaultValue $"{homeOf ctx}/.aws/credentials"
+
+let awsConfigPath ctx = env "AWS_CONFIG_FILE" |> Option.defaultValue $"{homeOf ctx}/.aws/config"
+
+let profileConfig rows profile =
+    match profile with
+    | Some p -> section rows $"profile {p}"
+    | None -> section rows "default"
+
+let profileCreds rows profile =
+    match profile with
+    | Some p -> section rows p
+    | None -> section rows "default"
+
+let credProcessOrSso config creds profile =
+    match config with
+    | None -> false
+    | Some rows ->
+        let cs = profileConfig rows profile |> Option.defaultValue []
+        let cr = creds |> Option.bind (fun c -> profileCreds c profile)
+        let inCreds k = cr |> Option.map (fun p -> has p k) |> Option.defaultValue false
+        has cs "credential_process" || has cs "sso_session" || has cs "sso_start_url" || inCreds "credential_process" || inCreds "sso_start_url"
+
+let definedCreds creds profile =
+    if ["AWS_ACCESS_KEY_ID"; "AWS_SECRET_ACCESS_KEY"; "AWS_SESSION_TOKEN"] |> Seq.exists (fun v -> env v <> None) then true
+    else
+        creds
+        |> Option.bind (fun c -> profileCreds c profile)
+        |> Option.map (fun p -> has p "aws_access_key_id")
+        |> Option.defaultValue false
+
+let sourceProfile config creds profile =
+    match config |> Option.bind (fun rows -> profileConfig rows profile) with
+    | None -> false
+    | Some cs ->
+        let src = iniGet cs "source_profile"
+        credProcessOrSso config creds src || definedCreds creds src
+
+let awsExpiry ctx config creds profile =
+    match firstEnv ["AWS_CREDENTIAL_EXPIRATION"; "AWS_SESSION_EXPIRATION"; "AWSUME_EXPIRATION"] with
+    | Some e -> Instant.tryParse e
+    | None ->
+        match creds |> Option.bind (fun c -> profileCreds c profile) with
+        | Some sec -> ["expiration"; "x_security_token_expires"] |> Seq.tryPick (iniGet sec) |> Option.bind Instant.tryParse
+        | None ->
+            config
+            |> Option.bind (fun rows -> profileConfig rows profile)
+            |> Option.bind (fun sec -> iniGet sec "sso_session" |> Option.orElse (iniGet sec "sso_start_url"))
+            |> Option.bind sha1Hex
+            |> Option.bind (fun key -> X.readFile $"{homeOf ctx}/.aws/sso/cache/{key}.json")
+            |> Option.bind (fun j -> [j] |> from json {| expiresAt: Option<string> |} |> try |> Option.bind (fun r -> r.expiresAt))
+            |> Option.bind Instant.tryParse
+
+/// aws: profile/region from env and ~/.aws (shown only with credentials)
+let aws : Ctx -> seq<Seg>
+
+let aws ctx =
+    let cfg = ctx.cfg.aws
+    let config = readIni (awsConfigPath ctx)
+    let creds = readIni (awsCredsPath ctx)
+    let profile = firstEnv ["AWSU_PROFILE"; "AWS_VAULT"; "AWSUME_PROFILE"; "AWS_PROFILE"; "AWS_SSO_PROFILE"]
+    let regionOf p = config |> Option.bind (fun rows -> profileConfig rows p) |> Option.bind (fun s -> iniGet s "region")
+    let region = firstEnv ["AWS_REGION"; "AWS_DEFAULT_REGION"] |> Option.orElseWith (fun () -> regionOf profile)
+    let force = getOr cfg (fun c -> c.force_display) false
+    let shown = force || credProcessOrSso config creds profile || sourceProfile config creds profile || definedCreds creds profile
+    if isDisabled cfg false || (profile == None && region == None) || not shown then X.none
+    else
+        let duration =
+            awsExpiry ctx config creds profile
+            |> Option.map (fun t ->
+                let secs = Instant.epochMs t / 1000 - Instant.epochMs (Instant.now ()) / 1000
+                if secs > 0 then renderTime (secs * 1000) else getOr cfg (fun c -> c.expiration_symbol) "X")
+        let regionAliases = getOr cfg (fun c -> c.region_aliases) []
+        let profileAliases = getOr cfg (fun c -> c.profile_aliases) []
+        let vars n =
+            match n with
+            | "profile" -> profile |> Option.map (alias profileAliases) |> lift
+            | "region" -> region |> Option.map (alias regionAliases) |> lift
+            | "duration" -> lift duration
+            | _ -> None
+        X.render (getOr cfg (fun c -> c.format) "on [$symbol($profile )(\\($region\\) )(\\[$duration\\] )]($style)") (getOr cfg (fun c -> c.symbol) "☁️  ") (getOr cfg (fun c -> c.style) "bold yellow") vars
+
+// ---- azure -------------------------------------------------------------------------
+
+type AzUser = { name: string }
+type AzSub = { name: string; user: AzUser; isDefault: bool }
+type AzProfile = { installationId: string; subscriptions: Option<seq<AzSub>> }
+
+/// azure: the default subscription in azureProfile.json
+let azure : Ctx -> seq<Seg>
+
+let azure ctx =
+    let cfg = ctx.cfg.azure
+    let dir = env "AZURE_CONFIG_DIR" |> Option.defaultValue $"{homeOf ctx}/.azure"
+    let sub =
+        X.readFile $"{dir}/azureProfile.json"
+        |> Option.bind (fun j -> [stripBom j] |> from json AzProfile |> try)
+        |> Option.bind (fun p -> p.subscriptions |> Option.defaultValue [] |> Seq.tryFind (fun s -> s.isDefault))
+    match sub with
+    | Some s when not (isDisabled cfg true) ->
+        let aliases = getOr cfg (fun c -> c.subscription_aliases) []
+        let vars n =
+            match n with
+            | "subscription" -> Some (F.Plain (alias aliases s.name))
+            | "username" -> Some (F.Plain s.user.name)
+            | _ -> None
+        X.render (getOr cfg (fun c -> c.format) "on [$symbol($subscription)]($style) ") (getOr cfg (fun c -> c.symbol) "󰠅 ") (getOr cfg (fun c -> c.style) "blue bold") vars
+    | _ -> X.none
+
+// ---- gcloud ------------------------------------------------------------------------
+
+/// gcloud: the active configuration's account/project/region
+let gcloud : Ctx -> seq<Seg>
+
+let gcloud ctx =
+    let cfg = ctx.cfg.gcloud
+    let dir = env "CLOUDSDK_CONFIG" |> Option.defaultValue $"{homeOf ctx}/.config/gcloud"
+    let active =
+        env "CLOUDSDK_ACTIVE_CONFIG_NAME"
+        |> Option.orElseWith (fun () ->
+            if File.exists $"{dir}/active_config" then File.read $"{dir}/active_config" |> Seq.tryHead else None)
+    match active with
+    | Some name when name <> "NONE" && not (isDisabled cfg false) && X.envDetect (getOr cfg (fun c -> c.detect_env_vars) []) ->
+        let rows = readIni $"{dir}/configurations/config_{name}"
+        let get sec key = rows |> Option.bind (fun r -> section r sec) |> Option.bind (fun p -> iniGet p key)
+        let account = get "core" "account" |> Option.map (fun a -> Str.trySplitOnce "@" a |> Option.map (fun (u, d) -> (u, Some d)) |> Option.defaultValue (a, None))
+        let regionAliases = getOr cfg (fun c -> c.region_aliases) []
+        let projectAliases = getOr cfg (fun c -> c.project_aliases) []
+        let vars n =
+            match n with
+            | "account" -> account |> Option.map fst |> lift
+            | "domain" -> account |> Option.bind snd |> lift
+            | "region" -> env "CLOUDSDK_COMPUTE_REGION" |> Option.orElseWith (fun () -> get "compute" "region") |> Option.map (alias regionAliases) |> lift
+            | "project" -> env "CLOUDSDK_CORE_PROJECT" |> Option.orElseWith (fun () -> get "core" "project") |> Option.map (alias projectAliases) |> lift
+            | "active" -> X.plain name
+            | _ -> None
+        X.render (getOr cfg (fun c -> c.format) "on [$symbol$account(@$domain)(\\($region\\))]($style) ") (getOr cfg (fun c -> c.symbol) "☁️  ") (getOr cfg (fun c -> c.style) "bold blue") vars
+    | _ -> X.none
+
+// ---- openstack ---------------------------------------------------------------------
+
+type OsAuth = { project_name: Option<string> }
+type OsCloud = { auth: Option<OsAuth> }
+type OsClouds = { clouds: Option<seq<string * OsCloud>> }
+
+let osProject ctx cloud =
+    [Path.combine ctx.cwd "clouds.yaml"; $"{homeOf ctx}/.config/openstack/clouds.yaml"; "/etc/openstack/clouds.yaml"]
+    |> Seq.choose (fun p ->
+        X.readFile p
+        |> Option.bind (fun y -> Str.split "\n" y |> from yaml OsClouds |> try)
+        |> Option.bind (fun c -> c.clouds)
+        |> Option.bind (fun cs -> cs |> Seq.tryFind (fun (k, _) -> k == cloud))
+        |> Option.bind (fun (_, c) -> c.auth)
+        |> Option.bind (fun a -> a.project_name))
+    |> Seq.tryFind (fun s -> s <> "")
+
+/// openstack: OS_CLOUD and its project
+let openstack : Ctx -> seq<Seg>
+
+let openstack ctx =
+    let cfg = ctx.cfg.openstack
+    match env "OS_CLOUD" with
+    | Some cloud when not (isDisabled cfg false) ->
+        let project = env "OS_PROJECT_NAME" |> Option.orElseWith (fun () -> osProject ctx cloud)
+        let vars n =
+            match n with
+            | "cloud" -> X.plain cloud
+            | "project" -> lift project
+            | _ -> None
+        X.render (getOr cfg (fun c -> c.format) "on [$symbol$cloud(\\($project\\))]($style) ") (getOr cfg (fun c -> c.symbol) "☁️  ") (getOr cfg (fun c -> c.style) "bold yellow") vars
+    | _ -> X.none
+
+// ---- kubernetes --------------------------------------------------------------------
+
+type KubeInner = { user: Option<string>; namespace: Option<string>; cluster: Option<string> }
+type KubeEntry = { name: Option<string>; context: Option<KubeInner> }
+type KubeDoc = {
+    [<Wire "current-context">]
+    current: Option<string>
+    contexts: Option<seq<KubeEntry>>
+}
+
+let kubeDoc text =
+    if Str.startsWith "{" text then
+        [text] |> from json KubeDoc |> try |> Option.orElseWith (fun () -> Str.split "\n" text |> from yaml KubeDoc |> try)
+    else
+        Str.split "\n" text |> from yaml KubeDoc |> try
+
+// Rust-regex replace for an anchored pattern: named groups `(?P<n>…)` /
+// `(?<n>…)` become positional (Rust numbers them in paren order, as here);
+// the replacement expands `$n`, `${n}`, `$name`, `${name}` and `$$`
+let groupNames pattern =
+    Str.rmatchAll @"(\\.|\[(?:\\.|[^\]])*\]|\(\?P?<([A-Za-z_][A-Za-z0-9_]*)>|\((?!\?)|.)" pattern
+    |> Seq.fold (fun (idx, names) g ->
+        let t = g[0]
+        if t == "(" then (idx + 1, names)
+        elif Str.startsWith "(?" t && g[1] <> "" then (idx + 1, Seq.append names [(g[1], idx + 1)] |> Seq.freeze)
+        else (idx, names)) (0, [])
+    |> snd
+
+let positional pattern = Str.rsplit @"\(\?P?<[A-Za-z_][A-Za-z0-9_]*>" pattern |> Str.join "("
+
+let regexReplace pattern value replacement =
+    let names = groupNames pattern
+    match Str.rmatch $"^(?:{positional pattern})$" value |> try |> Option.flatten with
+    | Some groups ->
+        let gs = Seq.append [value] groups |> Seq.freeze
+        let group name =
+            let idx =
+                match Str.tryToInt name with
+                | Some i -> Some i
+                | None -> names |> Seq.tryFind (fun (k, _) -> k == name) |> Option.map snd
+            idx |> Option.bind (fun i -> Seq.tryItem i gs) |> Option.defaultValue ""
+        Str.rmatchAll @"(\$\$|\$\{([^}]*)\}|\$([A-Za-z0-9_]+)|\$|[^$]+)" replacement
+        |> Seq.map (fun g ->
+            if g[0] == "$$" then "$"
+            elif g[1] <> "" then group g[1]
+            elif g[2] <> "" then group g[2]
+            else g[0])
+        |> Str.join ""
+        |> Some
+    | None -> None
+
+let aliasedName pattern current aliasOpt =
+    match aliasOpt |> Option.orElse current with
+    | None -> None
+    | Some replacement ->
+        match pattern with
+        | None -> Some replacement
+        | Some p ->
+            match current with
+            | None -> None
+            | Some v -> if v == p then Some replacement else regexReplace p v replacement
+
+let deprecatedAlias aliases v =
+    match aliases |> Seq.tryFind (fun (k, _) -> k == v) with
+    | Some (_, a) -> a
+    | None -> aliases |> Seq.tryPick (fun (k, a) -> regexReplace k v a) |> Option.defaultValue v
+
+/// kubernetes: the current kubeconfig context (disabled by default)
+let kubernetes : Ctx -> seq<Seg>
+
+let kubernetes ctx =
+    let cfg = ctx.cfg.kubernetes
+    let envVars = getOr cfg (fun c -> c.detect_env_vars) []
+    let files = getOr cfg (fun c -> c.detect_files) []
+    let folders = getOr cfg (fun c -> c.detect_folders) []
+    let exts = getOr cfg (fun c -> c.detect_extensions) []
+    let haveEnv = if Seq.isEmpty envVars then None else Some (X.envDetect envVars)
+    let haveScan = if Seq.isEmpty files && Seq.isEmpty folders && Seq.isEmpty exts then None else Some (X.scan ctx files exts folders)
+    let applies = haveScan |> Option.orElse haveEnv |> Option.defaultValue true
+    if isDisabled cfg true || not applies then X.none
+    else
+        let paths = env "KUBECONFIG" |> Option.defaultValue $"{homeOf ctx}/.kube/config" |> Str.split ":" |> Seq.where (fun p -> p <> "")
+        let docs = paths |> Seq.choose X.readFile |> Seq.choose kubeDoc |> Seq.freeze
+        match docs |> Seq.tryPick (fun d -> d.current |> Option.bind X.plain |> Option.map (fun _ -> d.current |> Option.defaultValue "")) with
+        | None -> X.none
+        | Some current ->
+            let comps =
+                docs
+                |> Seq.tryPick (fun d -> d.contexts |> Option.defaultValue [] |> Seq.tryFind (fun e -> e.name == Some current))
+                |> Option.bind (fun e -> e.context)
+                |> Option.defaultValue { user = None; namespace = None; cluster = None }
+            let matched =
+                getOr cfg (fun c -> c.contexts) []
+                |> Seq.tryPick (fun cc ->
+                    match aliasedName (Some (cc.context_pattern |> Option.defaultValue "")) (Some current) cc.context_alias with
+                    | None -> None
+                    | Some ctxAlias ->
+                        let userAlias = aliasedName cc.user_pattern comps.user cc.user_alias
+                        if cc.user_pattern <> None && userAlias == None then None
+                        else Some (Some cc, ctxAlias, userAlias))
+            let (mcfg, dispCtx, dispUser) = matched |> Option.defaultValue (None, current, comps.user)
+            let shownCtx = deprecatedAlias (getOr cfg (fun c -> c.context_aliases) []) dispCtx
+            let shownUser = dispUser |> Option.map (deprecatedAlias (getOr cfg (fun c -> c.user_aliases) []))
+            let style = mcfg |> Option.bind (fun c -> c.style) |> Option.defaultValue (getOr cfg (fun c -> c.style) "cyan bold")
+            let symbol = mcfg |> Option.bind (fun c -> c.symbol) |> Option.defaultValue (getOr cfg (fun c -> c.symbol) "☸ ")
+            let vars n =
+                match n with
+                | "context" -> Some (F.Plain shownCtx)
+                | "namespace" -> comps.namespace |> Option.map F.Plain
+                | "cluster" -> comps.cluster |> Option.map F.Plain
+                | "user" -> shownUser |> Option.map F.Plain
+                | _ -> None
+            X.render (getOr cfg (fun c -> c.format) "[$symbol$context( \\($namespace\\))]($style) in ") symbol style vars
+
+// ---- docker_context -----------------------------------------------------------------
+
+/// docker_context: a non-default docker context, in a docker project
+let docker_context : Ctx -> seq<Seg>
+
+let docker_context ctx =
+    let cfg = ctx.cfg.docker_context
+    let files = getOr cfg (fun c -> c.detect_files) ["compose.yml"; "compose.yaml"; "docker-compose.yml"; "docker-compose.yaml"; "Dockerfile"]
+    let scanned = X.scan ctx files (getOr cfg (fun c -> c.detect_extensions) []) (getOr cfg (fun c -> c.detect_folders) [])
+    if isDisabled cfg false || (getOr cfg (fun c -> c.only_with_files) true && not scanned) then X.none
+    else
+        let dir = env "DOCKER_CONFIG" |> Option.defaultValue $"{homeOf ctx}/.docker"
+        let current =
+            firstEnv ["DOCKER_MACHINE_NAME"; "DOCKER_HOST"; "DOCKER_CONTEXT"]
+            |> Option.orElseWith (fun () ->
+                X.readFile $"{dir}/config.json"
+                |> Option.bind (fun j -> [j] |> from json {| currentContext: Option<string> |} |> try)
+                |> Option.bind (fun c -> c.currentContext))
+        match current with
+        | Some c when not (Seq.contains c ["default"; "desktop-linux"]) && not (Str.startsWith "unix://" c) ->
+            X.render (getOr cfg (fun c -> c.format) "via [$symbol$context]($style) ") (getOr cfg (fun c -> c.symbol) "🐳 ") (getOr cfg (fun c -> c.style) "blue bold") (fun n -> if n == "context" then Some (F.Plain c) else None)
+        | _ -> X.none
+
+// ---- nats --------------------------------------------------------------------------
+
+/// nats: the current nats context (disabled by default)
+let nats : Ctx -> seq<Seg>
+
+let nats ctx =
+    let cfg = ctx.cfg.nats
+    if isDisabled cfg true then X.none
+    else
+        match X.exec ctx "nats" ["context"; "info"; "--json"] |> Option.bind (fun o -> [o.stdout] |> from json {| name: Option<string> |} |> try) with
+        | Some info ->
+            X.render (getOr cfg (fun c -> c.format) "[$symbol($name )]($style)") (getOr cfg (fun c -> c.symbol) "✉️ ") (getOr cfg (fun c -> c.style) "bold purple") (fun n -> if n == "name" then info.name |> Option.map F.Plain else None)
+        | None -> X.none
+
+// ---- pulumi -------------------------------------------------------------------------
+
+type PulumiBackend = { url: Option<string> }
+type PulumiProject = { name: Option<string>; backend: Option<PulumiBackend> }
+type PulumiWorkspace = { stack: Option<string>; stacks: Option<seq<string * string>> }
+type PulumiAccount = { username: Option<string> }
+type PulumiCreds = { current: Option<string>; accounts: Option<seq<string * PulumiAccount>> }
+
+let pulumiHome ctx = env "PULUMI_HOME" |> Option.defaultValue $"{homeOf ctx}/.pulumi"
+
+let pulumiCreds ctx =
+    X.readFile $"{pulumiHome ctx}/credentials.json" |> Option.bind (fun j -> [j] |> from json PulumiCreds |> try)
+
+let pulumiStack ctx projectFile =
+    let project = X.readFile projectFile |> Option.bind (fun y -> Str.split "\n" y |> from yaml PulumiProject |> try)
+    match project |> Option.bind (fun p -> p.name) with
+    | None -> None
+    | Some name ->
+        let projBackend = project |> Option.bind (fun p -> p.backend) |> Option.bind (fun b -> b.url)
+        let ws =
+            sha1Hex projectFile
+            |> Option.bind (fun h -> X.readFile $"{pulumiHome ctx}/workspaces/{name}-{h}-workspace.json")
+            |> Option.bind (fun j -> [j] |> from json PulumiWorkspace |> try)
+        match ws with
+        | None -> None
+        | Some w ->
+            let backend = env "PULUMI_BACKEND_URL" |> Option.orElse projBackend |> Option.orElseWith (fun () -> pulumiCreds ctx |> Option.bind (fun c -> c.current))
+            let stacks = w.stacks |> Option.defaultValue [] |> Seq.freeze
+            match backend |> Option.bind (fun b -> stacks |> Seq.tryFind (fun (k, _) -> k == b)) with
+            | Some (_, s) -> Some s
+            | None ->
+                if w.stack <> None then w.stack
+                elif backend == None && Seq.length stacks == 1 then stacks |> Seq.head |> snd |> Some
+                else None
+
+let pulumiVersion out =
+    let v = Str.trimEnd (if Str.startsWith "v" out then out[1..] else out)
+    match v with
+    | Regex @"^([^.]*\.[^.]*\.[^.]*)\." head -> head
+    | _ -> v
+
+/// pulumi: the selected stack of the nearest Pulumi project
+let pulumi : Ctx -> seq<Seg>
+
+let pulumi ctx =
+    let cfg = ctx.cfg.pulumi
+    let here = X.scan ctx ["Pulumi.yaml"; "Pulumi.yml"] [] []
+    let projectFile =
+        X.ancestors ctx.cwd
+        |> Seq.tryPick (fun d -> ["Pulumi.yaml"; "Pulumi.yml"] |> Seq.map (Path.combine d) |> Seq.tryFind File.exists)
+    match projectFile with
+    | Some pf when not (isDisabled cfg false) && (here || getOr cfg (fun c -> c.search_upwards) true) ->
+        let vars n =
+            match n with
+            | "version" -> X.execOut ctx "pulumi" ["version"] |> Option.map (fun o -> X.version (getOr cfg (fun c -> c.version_format) "v${raw}") (pulumiVersion o)) |> lift
+            | "username" -> pulumiCreds ctx |> Option.bind (fun c -> c.current |> Option.bind (fun cur -> c.accounts |> Option.defaultValue [] |> Seq.tryFind (fun (k, _) -> k == cur))) |> Option.bind (fun (_, a) -> a.username) |> lift
+            | "stack" -> pulumiStack ctx pf |> lift
+            | _ -> None
+        X.render (getOr cfg (fun c -> c.format) "via [$symbol($username@)$stack]($style) ") (getOr cfg (fun c -> c.symbol) " ") (getOr cfg (fun c -> c.style) "bold 5") vars
+    | _ -> X.none
+
+// ---- environments ------------------------------------------------------------------
+
+/// conda: CONDA_DEFAULT_ENV
+let conda : Ctx -> seq<Seg>
+
+let conda ctx =
+    let cfg = ctx.cfg.conda
+    let e = env "CONDA_DEFAULT_ENV" |> Option.defaultValue ""
+    let skip = Str.trim e == "" || (getOr cfg (fun c -> c.ignore_base) true && e == "base") || not (X.envDetect (getOr cfg (fun c -> c.detect_env_vars) ["!PIXI_ENVIRONMENT_NAME"]))
+    if isDisabled cfg false || skip then X.none
+    else
+        let shown = truncatePath e (getOr cfg (fun c -> c.truncation_length) 1)
+        X.render (getOr cfg (fun c -> c.format) "via [$symbol$environment]($style) ") (getOr cfg (fun c -> c.symbol) "🅒 ") (getOr cfg (fun c -> c.style) "green bold") (fun n -> if n == "environment" then Some (F.Plain shown) else None)
+
+/// spack: SPACK_ENV
+let spack : Ctx -> seq<Seg>
+
+let spack ctx =
+    let cfg = ctx.cfg.spack
+    let e = env "SPACK_ENV" |> Option.defaultValue ""
+    if isDisabled cfg false || Str.trim e == "" then X.none
+    else
+        let shown = truncatePath e (getOr cfg (fun c -> c.truncation_length) 1)
+        X.render (getOr cfg (fun c -> c.format) "via [$symbol$environment]($style) ") (getOr cfg (fun c -> c.symbol) "🅢 ") (getOr cfg (fun c -> c.style) "blue bold") (fun n -> if n == "environment" then Some (F.Plain shown) else None)
+
+/// nix_shell: IN_NIX_SHELL (or a /nix/store PATH with `heuristic`)
+let nix_shell : Ctx -> seq<Seg>
+
+let nix_shell ctx =
+    let cfg = ctx.cfg.nix_shell
+    let inNewShell () =
+        env "PATH" |> Option.defaultValue "" |> Str.split ":" |> Seq.exists (fun p -> p == "/nix/store" || Str.startsWith "/nix/store/" p)
+    let state =
+        match env "IN_NIX_SHELL" with
+        | Some "pure" -> Some (getOr cfg (fun c -> c.pure_msg) "pure")
+        | Some "impure" -> Some (getOr cfg (fun c -> c.impure_msg) "impure")
+        | _ -> if getOr cfg (fun c -> c.heuristic) false && inNewShell () then Some (getOr cfg (fun c -> c.unknown_msg) "") else None
+    match state with
+    | Some msg when not (isDisabled cfg false) ->
+        let style = getOr cfg (fun c -> c.style) "bold blue"
+        let vars n =
+            match n with
+            | "symbol" -> Some (F.Meta (getOr cfg (fun c -> c.symbol) "❄️  "))
+            | "state" -> Some (F.Meta msg)
+            | "name" -> env "name" |> Option.map F.Plain
+            | "level" -> env "NIX_SHELL_LEVEL" |> Option.map F.Plain
+            | _ -> None
+        F.render vars (fun n -> if n == "style" then Some style else None) (getOr cfg (fun c -> c.format) "via [$symbol$state( \\($name\\))]($style) ")
+    | _ -> X.none
+
+/// guix_shell: GUIX_ENVIRONMENT
+let guix_shell : Ctx -> seq<Seg>
+
+let guix_shell ctx =
+    let cfg = ctx.cfg.guix_shell
+    if isDisabled cfg false || env "GUIX_ENVIRONMENT" == None then X.none
+    else X.render (getOr cfg (fun c -> c.format) "via [$symbol]($style) ") (getOr cfg (fun c -> c.symbol) "🐃 ") (getOr cfg (fun c -> c.style) "yellow bold") (fun _ -> None)
+
+/// meson: a meson devenv (MESON_DEVENV=1, MESON_PROJECT_NAME)
+let meson : Ctx -> seq<Seg>
+
+let meson ctx =
+    let cfg = ctx.cfg.meson
+    match (env "MESON_DEVENV", env "MESON_PROJECT_NAME") with
+    | (Some "1", Some project) when Str.trim project <> "" && not (isDisabled cfg false) ->
+        let shown = truncateText project (getOr cfg (fun c -> c.truncation_length) 4294967295) (getOr cfg (fun c -> c.truncation_symbol) "…")
+        X.render (getOr cfg (fun c -> c.format) "via [$symbol$project]($style) ") (getOr cfg (fun c -> c.symbol) "⬢ ") (getOr cfg (fun c -> c.style) "blue bold") (fun n -> if n == "project" then Some (F.Plain shown) else None)
+    | _ -> X.none
+
+type RcStatus = { allowed: int; path: string }
+type DirenvRaw = { foundRC: Option<RcStatus>; loadedRC: Option<RcStatus> }
+
+// (rc path, allowed 0|1|2, loaded)
+let direnvState out =
+    match [out] |> from json {| state: DirenvRaw |} |> try with
+    | Some raw ->
+        match (raw.state.foundRC, raw.state.loadedRC) with
+        | (Some f, None) when f.allowed <= 2 -> Some (f.path, f.allowed, false)
+        | (Some f, Some l) when f.allowed <= 2 && l.allowed <= 2 -> Some (f.path, f.allowed, l.allowed == 0)
+        | _ -> None
+    | None ->
+        let lines = Str.split "\n" out |> Seq.freeze
+        let rc = lines |> Seq.tryPick (fun l -> if Str.startsWith "Found RC path" l then Some (Str.trim l[13..]) else None)
+        let allowed =
+            lines
+            |> Seq.tryPick (fun l -> if Str.startsWith "Found RC allowed" l then Some (Str.trim l[16..]) else None)
+            |> Option.bind (fun v ->
+                match v with
+                | "0" | "true" -> Some 0
+                | "1" -> Some 1
+                | "2" | "false" -> Some 2
+                | _ -> None)
+        let loaded = not (lines |> Seq.exists (Str.contains "No .envrc or .env loaded"))
+        match (rc, allowed) with
+        | (Some p, Some a) when p <> "" -> Some (p, a, loaded)
+        | _ -> None
+
+/// direnv: `direnv status` (disabled by default)
+let direnv : Ctx -> seq<Seg>
+
+let direnv ctx =
+    let cfg = ctx.cfg.direnv
+    let applies = X.envDetect (getOr cfg (fun c -> c.detect_env_vars) ["DIRENV_FILE"]) || X.scan ctx (getOr cfg (fun c -> c.detect_files) [".envrc"]) (getOr cfg (fun c -> c.detect_extensions) []) (getOr cfg (fun c -> c.detect_folders) [])
+    if isDisabled cfg true || not applies then X.none
+    else
+        match X.exec ctx "direnv" ["status"; "--json"] |> Option.bind (fun o -> direnvState o.stdout) with
+        | Some (rc, allowed, loaded) ->
+            let vars n =
+                match n with
+                | "rc_path" -> Some (F.Plain rc)
+                | "allowed" ->
+                    match allowed with
+                    | 0 -> Some (F.Plain (getOr cfg (fun c -> c.allowed_msg) "allowed"))
+                    | 1 -> Some (F.Plain (getOr cfg (fun c -> c.not_allowed_msg) "not allowed"))
+                    | _ -> Some (F.Plain (getOr cfg (fun c -> c.denied_msg) "denied"))
+                | "loaded" -> Some (F.Plain (if loaded then getOr cfg (fun c -> c.loaded_msg) "loaded" else getOr cfg (fun c -> c.unloaded_msg) "not loaded"))
+                | _ -> None
+            renderPlainSymbol (getOr cfg (fun c -> c.format) "[$symbol$loaded/$allowed]($style) ") (getOr cfg (fun c -> c.symbol) "direnv ") (getOr cfg (fun c -> c.style) "bold bright-yellow") vars
+        | None -> X.none
+
+/// mise: `mise doctor` health (disabled by default)
+let mise : Ctx -> seq<Seg>
+
+let mise ctx =
+    let cfg = ctx.cfg.mise
+    let applies = X.scan ctx (getOr cfg (fun c -> c.detect_files) ["mise.toml"; "mise.local.toml"; ".mise.toml"; ".mise.local.toml"]) (getOr cfg (fun c -> c.detect_extensions) []) (getOr cfg (fun c -> c.detect_folders) [".mise"])
+    if isDisabled cfg true || not applies then X.none
+    else
+        let vars n =
+            match n with
+            | "health" ->
+                match X.exec ctx "mise" ["doctor"] with
+                | Some _ -> X.plain (getOr cfg (fun c -> c.healthy_symbol) "healthy")
+                | None -> X.plain (getOr cfg (fun c -> c.unhealthy_symbol) "unhealthy")
+            | _ -> None
+        renderPlainSymbol (getOr cfg (fun c -> c.format) "on [$symbol$health]($style) ") (getOr cfg (fun c -> c.symbol) "mise ") (getOr cfg (fun c -> c.style) "bold purple") vars
+
+/// singularity: SINGULARITY_NAME
+let singularity : Ctx -> seq<Seg>
+
+let singularity ctx =
+    let cfg = ctx.cfg.singularity
+    match env "SINGULARITY_NAME" with
+    | Some name when not (isDisabled cfg false) ->
+        X.render (getOr cfg (fun c -> c.format) "[$symbol\\[$env\\]]($style) ") (getOr cfg (fun c -> c.symbol) "") (getOr cfg (fun c -> c.style) "blue bold dimmed") (fun n -> if n == "env" then Some (F.Plain name) else None)
+    | _ -> X.none
+
+let containerName () =
+    if Dir.exists "/proc/vz" && not (Dir.exists "/proc/bc") then Some "OpenVZ"
+    elif File.exists "/run/host/container-manager" then Some "OCI"
+    elif File.exists "/dev/incus/sock" then Some "Incus"
+    elif File.exists "/run/.containerenv" then
+        X.readFile "/run/.containerenv"
+        |> Option.bind (fun text ->
+            Str.split "\n" text
+            |> Seq.tryPick (fun l ->
+                match l with
+                | Regex @"^name=""(.*)""$" n -> Some n
+                | Regex @"^name=""" () -> None
+                | Regex @"^image=""(.*)$" r ->
+                    let tail = match Str.tryRsplitOnce "/" r with | Some (_, t) -> t | None -> r
+                    Some (Str.trimEnd tail |> Str.rmatch @"^(.*?)""*$" |> Option.map (fun g -> g[0]) |> Option.defaultValue tail)
+                | _ -> None))
+        |> Option.defaultValue "podman"
+        |> Some
+    else
+        match X.readFile "/run/systemd/container" |> Option.map Str.trim with
+        | Some "docker" -> Some "Docker"
+        | Some "wsl" -> if File.exists "/.dockerenv" then Some "Docker" else None
+        | Some _ -> Some "Systemd"
+        | None -> if File.exists "/.dockerenv" then Some "Docker" else None
+
+/// container: the container runtime we run in (Linux)
+let container : Ctx -> seq<Seg>
+
+let container ctx =
+    let cfg = ctx.cfg.container
+    if isDisabled cfg false then X.none
+    else
+        match containerName () with
+        | Some name ->
+            X.render (getOr cfg (fun c -> c.format) "[$symbol \\[$name\\]]($style) ") (getOr cfg (fun c -> c.symbol) "⬢") (getOr cfg (fun c -> c.style) "red bold dimmed") (fun n -> if n == "name" then Some (F.Plain name) else None)
+        | None -> X.none
+
+/// netns: `ip netns identify` (Linux)
+let netns : Ctx -> seq<Seg>
+
+let netns ctx =
+    let cfg = ctx.cfg.netns
+    if isDisabled cfg false then X.none
+    else
+        match X.execOut ctx "ip" ["netns"; "identify"] with
+        | Some name when name <> "" ->
+            X.render (getOr cfg (fun c -> c.format) "[$symbol \\[$name\\]]($style) ") (getOr cfg (fun c -> c.symbol) "🛜") (getOr cfg (fun c -> c.style) "blue bold dimmed") (fun n -> if n == "name" then Some (F.Plain name) else None)
+        | _ -> X.none
+
+// ---- package ------------------------------------------------------------------------
+
+type VersionDoc = { version: Option<string> }
+type YamlVersionDoc = { version: Option<Yaml> }
+type NodePkg = { version: Option<string>; private: Option<bool> }
+type CargoWsPkg = { version: Option<string> }
+type CargoWs = { package: Option<CargoWsPkg> }
+type CargoPkg = { version: Option<Yaml> }
+type CargoToml = { package: Option<CargoPkg>; workspace: Option<CargoWs> }
+type PyProject = { version: Option<string>; dynamic: Option<seq<string>> }
+type PoetryTool = { version: Option<string> }
+type HatchVersion = { path: Option<string> }
+type HatchTool = { version: Option<HatchVersion> }
+type PyTools = { poetry: Option<PoetryTool>; hatch: Option<HatchTool> }
+type PyProjectToml = { project: Option<PyProject>; tool: Option<PyTools> }
+
+let jsonVersion text = [text] |> from json VersionDoc |> try |> Option.bind (fun d -> d.version)
+
+// YAML `version:` (a flow-style document outside weir's YAML subset falls
+// back to a top-level line scan)
+let yamlVersion text =
+    match Str.split "\n" text |> from yaml YamlVersionDoc |> try result with
+    | Ok d ->
+        match d.version with
+        | Some (YStr v) -> Some v
+        | _ -> None
+    | Error _ ->
+        match Str.rmatch @"(?m)^version:[ \t]*[""']?([^""'\s#]+)" text with
+        | Some g -> Some g[0]
+        | None -> None
+
+let tomlVersion text = [text] |> from toml VersionDoc |> try |> Option.bind (fun d -> d.version)
+
+let rx pattern text = Str.rmatch pattern text |> Option.map (fun g -> g[0])
+
+// jsonc: drop comments and trailing commas outside strings
+let jsonc text =
+    Str.rmatchAll @"(""(?:[^""\\]|\\.)*""|//[^\n]*|/\*[\s\S]*?\*/|[^""/]+|/)" text
+    |> Seq.map (fun g ->
+        let t = g[0]
+        if Str.startsWith "//" t || Str.startsWith "/*" t then ""
+        elif Str.startsWith "\"" t then t
+        else t)
+    |> Str.join ""
+    |> fun s -> Str.rsplit @",(?=\s*[}\]])" s |> Str.join ""
+
+let cargoVersion ctx =
+    X.readLocal ctx "Cargo.toml"
+    |> Option.bind (fun t -> [t] |> from toml CargoToml |> try)
+    |> Option.bind (fun toml ->
+        let wsVersion d = d.workspace |> Option.bind (fun w -> w.package) |> Option.bind (fun p -> p.version)
+        match toml.package |> Option.bind (fun p -> p.version) with
+        | Some (YStr v) -> Some v
+        | Some (YMap pairs) when pairs |> Seq.exists (fun (k, v) -> k == "workspace" && (match v with | YBool true -> true | _ -> false)) ->
+            if toml.workspace <> None then wsVersion toml
+            else
+                X.ancestors ctx.cwd
+                |> Seq.skip 1
+                |> Seq.tryPick (fun d -> X.readFile (Path.combine d "Cargo.toml"))
+                |> Option.bind (fun t -> [t] |> from toml CargoToml |> try)
+                |> Option.bind wsVersion
+        | _ -> wsVersion toml)
+
+let nodeVersion ctx displayPrivate vfmt =
+    match X.readLocal ctx "package.json" |> Option.bind (fun t -> [t] |> from json NodePkg |> try) with
+    | Some p when displayPrivate || p.private <> Some true ->
+        match p.version with
+        | Some v when v <> "null" ->
+            let f = parseVersion vfmt v
+            if f == "v0.0.0-development" || Str.startsWith "v0.0.0-semantic" f then Some "semantic" else Some f
+        | _ -> None
+    | _ -> None
+
+let pyprojectVersion ctx =
+    X.readLocal ctx "pyproject.toml"
+    |> Option.bind (fun t -> [t] |> from toml PyProjectToml |> try)
+    |> Option.bind (fun py ->
+        let static = py.project |> Option.bind (fun p -> p.version)
+        let isDynamic = py.project |> Option.bind (fun p -> p.dynamic) |> Option.map (Seq.contains "version") |> Option.defaultValue false
+        let dynamic () =
+            if not isDynamic then None
+            else
+                py.tool
+                |> Option.bind (fun t -> t.hatch)
+                |> Option.bind (fun h -> h.version)
+                |> Option.bind (fun v -> v.path)
+                |> Option.bind (fun p -> X.readFile (Path.combine ctx.cwd p))
+                |> Option.bind (fun text -> Str.rmatch @"(__version__|VERSION)\s*=\s*[""']([^""']+)[""']" text |> Option.map (fun g -> g[1]))
+                |> Option.bind (fun v -> if Str.isMatch @"^\d+(\.\d+)*" v then Some v else None)
+        static
+        |> Option.orElseWith dynamic
+        |> Option.orElseWith (fun () -> py.tool |> Option.bind (fun t -> t.poetry) |> Option.bind (fun p -> p.version)))
+
+let setupCfgVersion ctx =
+    X.readLocal ctx "setup.cfg"
+    |> Option.map ini
+    |> Option.bind (fun rows -> section rows "metadata")
+    |> Option.bind (fun p -> iniGet p "version")
+    |> Option.bind (fun v -> if Str.startsWith "attr:" v || Str.startsWith "file:" v then None else Some v)
+
+let gradleVersion ctx =
+    X.readLocal ctx "gradle.properties"
+    |> Option.bind (rx @"(?m)^\s*version\s*=\s*(.*)")
+    |> Option.orElseWith (fun () ->
+        X.readLocal ctx "build.gradle"
+        |> Option.orElseWith (fun () -> X.readLocal ctx "build.gradle.kts")
+        |> Option.bind (rx @"(?m)^version(?: |\s*=\s*)['""]([^'""]+)['""]$"))
+
+let mavenVersion ctx =
+    X.readLocal ctx "pom.xml"
+    |> Option.bind (fun t -> [t] |> from xml {| version: Option<string> |} |> try)
+    |> Option.bind (fun p -> p.version)
+    |> Option.map Str.trim
+    |> Option.bind (fun v -> if Str.startsWith "$" v then None else Some v)
+
+let mesonVersion ctx =
+    X.readLocal ctx "meson.build"
+    |> Option.map (fun t -> Str.fields t |> Str.join "")
+    |> Option.bind (rx @"project\([^())]*,version:'([^']+)'[^())]*\)")
+
+let jsrVersion ctx =
+    ["deno.json"; "deno.jsonc"; "jsr.json"; "jsr.jsonc"]
+    |> Seq.tryPick (fun f -> X.readLocal ctx f |> Option.map (fun t -> if Str.endsWith ".jsonc" f then jsonc t else t))
+    |> Option.bind jsonVersion
+
+let nimbleVersion ctx =
+    if not (X.scan ctx [] ["nimble"] []) then None
+    else X.exec ctx "nimble" ["dump"; "--json"] |> Option.bind (fun o -> jsonVersion o.stdout)
+
+/// package: the version of the package in cwd (22 manifest kinds)
+let package : Ctx -> seq<Seg>
+
+let package ctx =
+    let cfg = ctx.cfg.package
+    let vfmt = getOr cfg (fun c -> c.version_format) "v${raw}"
+    let fmtv o = o |> Option.map (parseVersion vfmt)
+    let local name = X.readLocal ctx name
+    let sources = [
+        (fun () -> cargoVersion ctx |> fmtv)
+        (fun () -> nimbleVersion ctx |> fmtv)
+        (fun () -> nodeVersion ctx (getOr cfg (fun c -> c.display_private) false) vfmt)
+        (fun () -> jsrVersion ctx |> fmtv)
+        (fun () -> pyprojectVersion ctx |> fmtv)
+        (fun () -> setupCfgVersion ctx |> fmtv)
+        (fun () -> local "composer.json" |> Option.bind jsonVersion |> fmtv)
+        (fun () -> gradleVersion ctx |> fmtv)
+        (fun () -> local "Project.toml" |> Option.bind tomlVersion |> fmtv)
+        (fun () -> local "mix.exs" |> Option.bind (rx @"(?m)version: ""([^""]+)""") |> fmtv)
+        (fun () -> local "Chart.yaml" |> Option.bind yamlVersion |> fmtv)
+        (fun () -> mavenVersion ctx |> fmtv)
+        (fun () -> mesonVersion ctx |> fmtv)
+        (fun () -> local "shard.yml" |> Option.bind yamlVersion |> fmtv)
+        (fun () -> local "v.mod" |> Option.bind (rx @"(?m)^\s*version\s*:\s*'([^']+)'") |> fmtv)
+        (fun () -> local "vpkg.json" |> Option.bind jsonVersion |> fmtv)
+        (fun () -> local "build.sbt" |> Option.bind (rx @"(?m)^(?:.*/)*\s*version\s*:=\s*.([\d\.]+)") |> fmtv)
+        (fun () -> local "daml.yaml" |> Option.bind yamlVersion |> fmtv)
+        (fun () -> local "pubspec.yaml" |> Option.bind yamlVersion |> fmtv)
+        (fun () -> local "DESCRIPTION" |> Option.bind (rx @"(?m)^Version:\s*(.*)$") |> fmtv)
+        (fun () -> local "galaxy.yml" |> Option.bind yamlVersion |> fmtv)
+        (fun () -> local "build.zig.zon" |> Option.bind (rx @"(?m)^\s*\.version\s*=\s*""([^""]+)""") |> fmtv)
+    ]
+    if isDisabled cfg false then X.none
+    else
+        match sources |> Seq.tryPick (fun f -> f ()) with
+        | Some v ->
+            X.render (getOr cfg (fun c -> c.format) "is [$symbol$version]($style) ") (getOr cfg (fun c -> c.symbol) "📦 ") (getOr cfg (fun c -> c.style) "208 bold") (fun n -> if n == "version" then Some (F.Plain v) else None)
+        | None -> X.none
+
+/// this file's modules, by starship name
+let modules : seq<string * (Ctx -> seq<Seg>)>
+
+let modules = [
+    ("aws", aws)
+    ("azure", azure)
+    ("conda", conda)
+    ("container", container)
+    ("direnv", direnv)
+    ("docker_context", docker_context)
+    ("gcloud", gcloud)
+    ("guix_shell", guix_shell)
+    ("kubernetes", kubernetes)
+    ("meson", meson)
+    ("mise", mise)
+    ("nats", nats)
+    ("netns", netns)
+    ("nix_shell", nix_shell)
+    ("openstack", openstack)
+    ("package", package)
+    ("pulumi", pulumi)
+    ("singularity", singularity)
+    ("spack", spack)
+]

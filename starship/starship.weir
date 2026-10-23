@@ -1,0 +1,217 @@
+module Starship
+
+// the prompt (src/print.rs): resolve the root `format` against every
+// module, `$all` standing for the PROMPT_ORDER modules the format does not
+// name explicitly. Modules run in parallel (starship's par_iter is
+// Seq.pmap here).
+//
+// Use from the REPL's init.weir:
+//
+//     import "/path/to/ports/starship/starship.weir" as Starship
+//     let prompt st = Starship.prompt st
+//     #session { prompt = prompt }
+
+import "./lib/config.weir" as C
+import "./lib/fmt.weir" as F
+import "./lib/ctx.weir" as X
+import "./lib/mods/lang_a.weir" as LangA
+import "./lib/mods/lang_b.weir" as LangB
+import "./lib/mods/vcs.weir" as Vcs
+import "./lib/mods/cloud.weir" as Cloud
+import "./lib/mods/sys.weir" as Sys
+
+/// configs/starship_root.rs PROMPT_ORDER
+let promptOrder : seq<string>
+
+let promptOrder = [
+    "username"
+    "hostname"
+    "localip"
+    "shlvl"
+    "singularity"
+    "kubernetes"
+    "nats"
+    "directory"
+    "vcsh"
+    "fossil_branch"
+    "fossil_metrics"
+    "git_branch"
+    "git_commit"
+    "git_state"
+    "git_metrics"
+    "git_status"
+    "hg_branch"
+    "hg_state"
+    "pijul_channel"
+    "docker_context"
+    "package"
+    "bun"
+    "c"
+    "cmake"
+    "cobol"
+    "cpp"
+    "daml"
+    "dart"
+    "deno"
+    "dotnet"
+    "elixir"
+    "elm"
+    "erlang"
+    "fennel"
+    "fortran"
+    "gleam"
+    "golang"
+    "gradle"
+    "haskell"
+    "haxe"
+    "helm"
+    "java"
+    "julia"
+    "kotlin"
+    "lua"
+    "maven"
+    "mojo"
+    "nim"
+    "nodejs"
+    "ocaml"
+    "odin"
+    "opa"
+    "perl"
+    "php"
+    "pulumi"
+    "purescript"
+    "python"
+    "quarto"
+    "raku"
+    "rlang"
+    "red"
+    "ruby"
+    "rust"
+    "scala"
+    "solidity"
+    "swift"
+    "terraform"
+    "typst"
+    "vlang"
+    "vagrant"
+    "xmake"
+    "zig"
+    "buf"
+    "guix_shell"
+    "nix_shell"
+    "conda"
+    "pixi"
+    "meson"
+    "spack"
+    "memory_usage"
+    "aws"
+    "gcloud"
+    "openstack"
+    "azure"
+    "direnv"
+    "env_var"
+    "mise"
+    "crystal"
+    "custom"
+    "sudo"
+    "cmd_duration"
+    "line_break"
+    "jobs"
+    "battery"
+    "time"
+    "status"
+    "container"
+    "netns"
+    "os"
+    "shell"
+    "character"
+]
+
+/// every module, by its starship name (`custom` and `env_var` take a
+/// `.name` suffix too)
+let registry : seq<string * (Ctx -> seq<Seg>)>
+
+let registry =
+    [LangA.modules; LangB.modules; Vcs.modules; Cloud.modules; Sys.modules] |> Seq.concat |> Seq.freeze
+
+/// one module's segments; `custom.<name>`/`env_var.<name>` address one
+/// entry of those tables; unknown names render nothing (starship logs them)
+let runModule : Ctx -> seq<string> -> string -> seq<Seg>
+
+let runModule ctx named name =
+    match Str.trySplitOnce "." name with
+    | Some ("custom", child) -> Sys.customOne ctx child
+    | Some ("env_var", child) -> Sys.envVarOne ctx child
+    | _ ->
+        if name == "custom" then
+            ctx.cfg.custom
+            |> Option.defaultValue []
+            |> Seq.where (fun (k, _) -> not (Seq.contains $"custom.{k}" named))
+            |> Seq.collect (fun (k, _) -> Sys.customOne ctx k)
+            |> Seq.freeze
+        elif name == "env_var" then
+            ctx.cfg.env_var
+            |> Option.defaultValue []
+            |> Seq.where (fun (k, _) -> not (Seq.contains $"env_var.{k}" named))
+            |> Seq.collect (fun (k, _) -> Sys.envVarOne ctx k)
+            |> Seq.freeze
+        else
+            match registry |> Seq.tryFind (fun (n, _) -> n == name) with
+            | Some (_, run) -> run ctx |> Seq.freeze
+            | None -> []
+
+/// a format's segments: `$all` is every PROMPT_ORDER module the format does
+/// not name; every referenced module runs once, in parallel
+let segmentsOf : Ctx -> string -> seq<Seg>
+
+let segmentsOf ctx fmt =
+    let named = F.variables fmt
+    let implicit =
+        if Seq.contains "all" named then promptOrder |> Seq.where (fun m -> not (Seq.contains m named)) |> Seq.freeze
+        else []
+    let wanted = Seq.append named implicit |> Seq.where (fun n -> n <> "all") |> Seq.distinct |> Seq.freeze
+    let results = wanted |> Seq.pmap (fun n -> (n, runModule ctx named n)) |> Seq.freeze
+    let lookup n = results |> Seq.tryFind (fun (k, _) -> k == n) |> Option.map snd
+    let vars n =
+        if n == "all" then
+            Some (F.ofSegs (implicit |> Seq.collect (fun m -> lookup m |> Option.defaultValue []) |> Seq.freeze))
+        else
+            lookup n |> Option.map F.ofSegs
+    F.render vars (fun _ -> None) fmt
+
+/// the prompt as painted lines; the last is the input line. A weir prompt
+/// has no right side, so `right_format` is right-aligned on the line above
+/// the input line (when the prompt has one).
+let lines : Ctx -> seq<string>
+
+let lines ctx =
+    let body = segmentsOf ctx (ctx.cfg.format |> Option.defaultValue "$all") |> F.splitLines
+    let n = Seq.length body
+    let rightFmt = ctx.cfg.right_format |> Option.defaultValue ""
+    let placed =
+        if rightFmt == "" || n < 2 then body
+        else
+            let right = segmentsOf ctx rightFmt |> Seq.where (fun s -> not (Str.contains "\n" s.text)) |> Seq.freeze
+            body
+            |> Seq.indexed
+            |> Seq.map (fun (i, l) -> if i == n - 2 then Seq.append l (Seq.append [{ text = " "; style = None; outer = []; fill = true }] right) else l)
+            |> Seq.freeze
+    let painted = placed |> Seq.map (F.paintLine ctx.color ctx.palette ctx.width) |> Seq.freeze
+    if ctx.cfg.add_newline |> Option.defaultValue true then Seq.append [""] painted |> Seq.freeze
+    else painted
+
+/// render the prompt for a directory and status, with a config file
+let render : string -> string -> bool -> Option<int> -> seq<string>
+
+let render configFile dir ok code =
+    lines (X.make (X.loadConfig configFile) dir ok code)
+
+/// the REPL prompt function: prints the upper lines (a weir prompt is one
+/// line) and returns the input line
+let prompt : PromptStatus -> string
+
+let prompt st =
+    let ls = render (X.configPath ()) pwd st.ok st.exit
+    let n = Seq.length ls
+    ls |> Seq.take (n - 1) |> Seq.iter print
+    ls |> Seq.last

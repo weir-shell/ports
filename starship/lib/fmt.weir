@@ -1,0 +1,427 @@
+module Fmt
+
+// starship's format-string language (src/formatter/spec.pest) and its
+// ANSI painter (config.rs parse_style_string, module.rs ansi_line).
+//
+//   format     = (text | $var | ${scoped.var} | [format](style) | (format))*
+//   [..](st)   = a text group: paints everything inside that has no style yet
+//   (..)       = a conditional: rendered only if a variable inside is non-empty
+//
+// weir has no recursion, so the tree is never built: a regex tokenizer feeds
+// one Seq.fold over an explicit frame stack, and a frame is resolved (styled,
+// or kept/dropped) when its closer arrives.
+
+/// one painted run of text; `fill` marks a $fill segment (expanded per line)
+type Seg = {
+    text: string
+    style: Option<string>
+    /// enclosing groups' styles, innermost first: used when `style` does not
+    /// parse (starship drops an invalid style, so the segment inherits)
+    outer: seq<string>
+    fill: bool
+}
+
+/// what a format variable resolves to
+type Value =
+    | Plain of string
+    | Styled of seq<Seg> * bool
+    | Meta of string
+
+type Kind =
+    | Root
+    | Group
+    | Cond
+
+type Frame = {
+    kind: Kind
+    segs: seq<Seg>
+    shown: bool
+    /// the frame holds any element (an empty `[](style)` still paints)
+    touched: bool
+}
+
+type Tok =
+    | TText of string
+    | TVar of string
+    | TOpenGroup
+    | TCloseGroup of string
+    | TOpenCond
+    | TCloseCond
+
+type Color =
+    | Ansi of int
+    | Fixed of int
+    | Rgb of int * int * int
+    | PrevFg
+    | PrevBg
+
+type Paint = {
+    attrs: seq<int>
+    fg: Option<Color>
+    bg: Option<Color>
+}
+
+/// the ESC character (weir strings have no \\u escape)
+let esc : string
+
+let esc = Bytes.fromHex "1b" |> Str.fromUtf8
+
+let tokPattern = @"(?s)(\\.|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\]\([^()]*\)|[\[\]()]|[^\\$\[\]()]+|\$)"
+
+let classify t =
+    match t with
+    | Regex @"(?s)^\\(.)$" c -> TText c
+    | Regex @"^\$\{([^}]*)\}$" n -> TVar n
+    | Regex @"^\$([A-Za-z_][A-Za-z0-9_]*)$" n -> TVar n
+    | Regex @"^\]\(([^()]*)\)$" st -> TCloseGroup st
+    | "[" -> TOpenGroup
+    | "(" -> TOpenCond
+    | ")" -> TCloseCond
+    | _ -> TText t
+
+let tokens fmt =
+    Str.rmatchAll tokPattern fmt |> Seq.map (fun g -> classify g[0]) |> Seq.freeze
+
+/// the variable names a format string references (meta formats included
+/// only when expanded by the caller)
+let variables : string -> seq<string>
+
+let variables fmt =
+    tokens fmt
+    |> Seq.choose (function | TVar n -> Some n | _ -> None)
+    |> Seq.distinct
+    |> Seq.freeze
+
+/// plain text segment, unstyled (inherits the enclosing group's style)
+let text : string -> Seg
+
+let text s = { text = s; style = None; outer = []; fill = false }
+
+/// a segment painted with a starship style string
+let styled : string -> string -> Seg
+
+let styled st s = { text = s; style = Some st; outer = []; fill = false }
+
+let segsVisible segs = segs |> Seq.exists (fun s -> s.text <> "")
+
+/// wrap module output for use as a variable value
+let ofSegs : seq<Seg> -> Value
+
+let ofSegs segs =
+    let f = segs |> Seq.freeze
+    Styled (f, segsVisible f)
+
+let emptyFrame k = { kind = k; segs = []; shown = false; touched = false }
+
+let push fr stack = stack |> Seq.append [fr]
+
+let addSegs segs shown stack =
+    match stack with
+    | top :: rest ->
+        rest |> Seq.append [{ top with segs = Seq.append top.segs segs |> Seq.freeze; shown = top.shown || shown }]
+    | [] -> [{ kind = Root; segs = segs; shown = shown; touched = true }]
+
+let resolveStyle styleVars st =
+    Str.rmatchAll @"(\$[A-Za-z_][A-Za-z0-9_]*|[^$]+|\$)" st
+    |> Seq.map (fun g ->
+        match g[0] with
+        | Regex @"^\$([A-Za-z_][A-Za-z0-9_]*)$" n -> styleVars n |> Option.defaultValue ""
+        | t -> t)
+    |> Str.join ""
+
+let inherit s g =
+    match g.style with
+    | None -> { g with style = Some s }
+    | Some _ -> { g with outer = Seq.append g.outer [s] |> Seq.freeze }
+
+let stepTok vars styleVars stack tok =
+    match tok with
+    | TText t -> addSegs [text t] false stack
+    | TVar n ->
+        match vars n with
+        | Some (Plain s) -> addSegs [text s] (s <> "") stack
+        | Some (Styled (ss, counts)) -> addSegs ss counts stack
+        | Some (Meta _) -> stack
+        | None -> stack
+    | TOpenGroup -> push (emptyFrame Group) stack
+    | TOpenCond -> push (emptyFrame Cond) stack
+    | TCloseCond ->
+        match stack with
+        | top :: rest when top.kind == Cond ->
+            let kept = if top.shown then top.segs else []
+            addSegs kept top.shown rest
+        | _ -> addSegs [text ")"] false stack
+    | TCloseGroup st ->
+        match stack with
+        | top :: rest when top.kind == Group ->
+            let s = resolveStyle styleVars st
+            let painted =
+                if not top.touched then
+                    [styled s ""]
+                else
+                    top.segs |> Seq.map (inherit s)
+            addSegs (painted |> Seq.freeze) top.shown rest
+        | _ -> addSegs [text $"]({st})"] false stack
+
+// every element but a closer marks its frame as non-empty
+let step vars styleVars stack tok =
+    let marked =
+        match (tok, stack) with
+        | (TCloseGroup _, _) -> stack
+        | (TCloseCond, _) -> stack
+        | (_, top :: rest) -> rest |> Seq.append [{ top with touched = true }]
+        | _ -> stack
+    stepTok vars styleVars marked tok
+
+let collapse stack =
+    stack
+    |> Seq.rev
+    |> Seq.fold (fun (acc, sh) fr -> (Seq.append acc fr.segs, sh || fr.shown)) ([], false)
+
+/// render without meta expansion: (segments, any-variable-non-empty)
+let render0 vars styleVars fmt =
+    let (segs, shown) =
+        tokens fmt
+        |> Seq.fold (step vars styleVars) [emptyFrame Root]
+        |> Seq.freeze
+        |> collapse
+    (segs |> Seq.freeze, shown)
+
+let noMeta vars n =
+    match vars n with
+    | Some (Meta _) -> None
+    | v -> v
+
+/// render a format string. `vars` resolves `$name`; a Meta value is itself a
+/// format (starship's map_meta: `$symbol`), rendered against the same
+/// variables minus metas. `styleVars` resolves `$name` inside `(style)`.
+let render : (string -> Option<Value>) -> (string -> Option<string>) -> string -> seq<Seg>
+
+let render vars styleVars fmt =
+    let expand n =
+        match vars n with
+        | Some (Meta m) ->
+            let (segs, shown) = render0 (noMeta vars) styleVars m
+            Some (Styled (segs, shown))
+        | v -> v
+    let (segs, _) = render0 expand styleVars fmt
+    segs
+
+// ---- painting -------------------------------------------------------------
+
+let named =
+    Map.ofPairs [
+        ("black", 0)
+        ("red", 1)
+        ("green", 2)
+        ("yellow", 3)
+        ("blue", 4)
+        ("purple", 5)
+        ("cyan", 6)
+        ("white", 7)
+        ("bright-black", 8)
+        ("bright-red", 9)
+        ("bright-green", 10)
+        ("bright-yellow", 11)
+        ("bright-blue", 12)
+        ("bright-purple", 13)
+        ("bright-cyan", 14)
+        ("bright-white", 15)
+    ]
+
+let hexVal h =
+    let digits = "0123456789abcdef"
+    Str.toLower h
+    |> Str.rmatchAll @"(.)"
+    |> Seq.map (fun g -> Str.tryIndexOf g[0] digits |> Option.defaultValue 0)
+    |> Seq.fold (fun acc d -> acc * 16 + d) 0
+
+let rawColor c =
+    match c with
+    | Regex @"^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$" (r, g, b) -> Some (Rgb (hexVal r, hexVal g, hexVal b))
+    | Regex @"^(\d{1,3})$" n when Str.toInt n < 256 -> Some (Fixed (Str.toInt n))
+    | _ -> None
+
+// hex, then u8, then the active palette, then the 16 names (config.rs order)
+let colorOf palette c =
+    match rawColor c with
+    | Some col -> Some col
+    | None ->
+        match palette |> Seq.tryFind (fun (k, _) -> k == c) with
+        | Some (_, v) -> rawColor v |> Option.orElse (Map.tryGet (Str.toLower v) named |> Option.map Ansi)
+        | None -> Map.tryGet c named |> Option.map Ansi
+
+let attrCode t =
+    match t with
+    | "bold" -> Some 1
+    | "dimmed" -> Some 2
+    | "italic" -> Some 3
+    | "underline" -> Some 4
+    | "blink" -> Some 5
+    | "inverted" -> Some 7
+    | "hidden" -> Some 8
+    | "strikethrough" -> Some 9
+    | _ -> None
+
+let styleToken palette acc raw =
+    match acc with
+    | None -> None
+    | Some p ->
+        let tok = Str.toLower raw
+        let (t, isFg) =
+            if Str.startsWith "fg:" tok then (tok[3..], true)
+            elif Str.startsWith "bg:" tok then (tok[3..], false)
+            else (tok, true)
+        match attrCode t with
+        | Some a -> Some { p with attrs = Seq.append p.attrs [a] |> Seq.freeze }
+        | None ->
+            let col =
+                match t with
+                | "prev_fg" -> Some PrevFg
+                | "prev_bg" -> Some PrevBg
+                | _ -> colorOf palette t
+            if t == "none" && isFg then None
+            elif isFg then col |> Option.map (fun c -> { p with fg = Some c })
+            else Some { p with bg = col }
+
+/// starship's parse_style_string: None when the style is invalid (an unknown
+/// fg colour or `fg:none` voids the whole style)
+let parseStyle : seq<string * string> -> string -> Option<Paint>
+
+let parseStyle palette st =
+    Str.fields st |> Seq.fold (styleToken palette) (Some { attrs = []; fg = None; bg = None })
+
+let fgCode c =
+    match c with
+    | Ansi n when n < 8 -> $"{30 + n}"
+    | Ansi n -> $"{90 + n - 8}"
+    | Fixed n -> $"38;5;{n}"
+    | Rgb (r, g, b) -> $"38;2;{r};{g};{b}"
+    | _ -> ""
+
+let bgCode c =
+    match c with
+    | Ansi n when n < 8 -> $"{40 + n}"
+    | Ansi n -> $"{100 + n - 8}"
+    | Fixed n -> $"48;5;{n}"
+    | Rgb (r, g, b) -> $"48;2;{r};{g};{b}"
+    | _ -> ""
+
+let resolvePrev prevFg prevBg c =
+    match c with
+    | Some PrevFg -> prevFg
+    | Some PrevBg -> prevBg
+    | other -> other
+
+let paintPlain = { attrs = []; fg = None; bg = None }
+
+/// a segment's concrete paint (prev_fg/prev_bg resolved against the
+/// previous segment's)
+let resolvePaint palette prev seg =
+    Seq.append (seg.style |> Option.map (fun st -> [st]) |> Option.defaultValue []) seg.outer
+    |> Seq.tryPick (parseStyle palette)
+    |> Option.map (fun p -> { p with fg = resolvePrev prev.fg prev.bg p.fg; bg = resolvePrev prev.fg prev.bg p.bg })
+    |> Option.defaultValue paintPlain
+
+let codesOf p =
+    let attrs = p.attrs |> Seq.distinct |> Seq.sort |> Seq.map (fun a -> $"{a}")
+    let bg = p.bg |> Option.map (fun c -> [bgCode c]) |> Option.defaultValue []
+    let fg = p.fg |> Option.map (fun c -> [fgCode c]) |> Option.defaultValue []
+    Seq.append attrs (Seq.append bg fg) |> Seq.freeze
+
+let sgr codes = if Seq.isEmpty codes then "" else $"{esc}[{codes |> Str.join ";"}m"
+
+let samePaint a b =
+    Seq.equal (a.attrs |> Seq.distinct |> Seq.sort) (b.attrs |> Seq.distinct |> Seq.sort) && show a.fg == show b.fg && show a.bg == show b.bg
+
+let isPlain p = Seq.isEmpty p.attrs && p.fg == None && p.bg == None
+
+// nu_ansi_term's Difference::between + AnsiStrings: from one paint to the
+// next, emit nothing (same), only the added codes (a superset), or a reset
+// and the full prefix
+let transition prev next =
+    if samePaint prev next then ""
+    elif isPlain next then $"{esc}[0m"
+    else
+        let lost = prev.attrs |> Seq.exists (fun a -> not (Seq.contains a next.attrs))
+        let lostFg = prev.fg <> None && next.fg == None
+        let lostBg = prev.bg <> None && next.bg == None
+        if lost || lostFg || lostBg then $"{esc}[0m" + sgr (codesOf next)
+        else
+            let attrs = next.attrs |> Seq.where (fun a -> not (Seq.contains a prev.attrs))
+            let extra = {
+                attrs = attrs |> Seq.freeze
+                fg = if show prev.fg == show next.fg then None else next.fg
+                bg = if show prev.bg == show next.bg then None else next.bg
+            }
+            sgr (codesOf extra)
+
+// terminal cell width, unicode-width's rules approximated: astral emoji and
+// East Asian wide/fullwidth ranges take 2 cells, an emoji-presentation
+// selector (U+FE0F) widens its base to 2, zero-width joiners/selectors and
+// combining marks take 0
+let wideCount s =
+    Str.rmatchAll @"([\uD83C-\uD83E][\uDC00-\uDFFF]|[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u231A\u231B\u23E9-\u23EC\u23F0\u23F3\u25FD\u25FE\u2614\u2615\u2648-\u2653\u267F\u2693\u26A1\u26AA\u26AB\u26BD\u26BE\u26C4\u26C5\u26CE\u26D4\u26EA\u26F2\u26F3\u26F5\u26FA\u26FD\u2705\u270A\u270B\u2728\u274C\u274E\u2753-\u2755\u2757\u2795-\u2797\u27B0\u27BF\u2B1B\u2B1C\u2B50\u2B55])" s
+    |> Seq.length
+
+let zeroCount s = Str.rmatchAll @"([\u200B-\u200F\uFE00-\uFE0F\u0300-\u036F\u20D0-\u20FF])" s |> Seq.length
+
+// a narrow base made wide by a following U+FE0F
+let selectorWide s = Str.rmatchAll @"([^\uD800-\uDFFF\uFE0F]\uFE0F)" s |> Seq.where (fun g -> wideCount g[0] == 0) |> Seq.length
+
+/// the terminal cells a string takes
+let width : string -> int
+
+let width s = Str.length s + wideCount s - zeroCount s + selectorWide s
+
+let lineWidth segs = segs |> Seq.where (fun s -> not s.fill) |> Seq.map (fun s -> width s.text) |> Seq.sum
+
+let fillTo w s =
+    let n = Str.length s
+    if n == 0 || w <= 0 then "" else (Str.replicate (w / n + 1) s)[0..w - 1]
+
+let expandFill width segs =
+    let fills = segs |> Seq.where (fun s -> s.fill) |> Seq.length
+    if fills == 0 then segs
+    else
+        let each = (width - lineWidth segs) / fills
+        segs |> Seq.map (fun s -> if s.fill then { s with text = fillTo each s.text; fill = false } else s) |> Seq.freeze
+
+/// split segments into lines at embedded newlines (line_break's "\n")
+let splitLines : seq<Seg> -> seq<seq<Seg>>
+
+let splitLines segs =
+    let (lines, cur) =
+        segs
+        |> Seq.fold (fun (lines, cur) s ->
+            let parts = Str.split "\n" s.text |> Seq.freeze
+            if Seq.length parts == 1 then (lines, Seq.append cur [s] |> Seq.freeze)
+            else
+                let first = { s with text = parts |> Seq.head }
+                let middle = parts |> Seq.skip 1 |> Seq.take (Seq.length parts - 2) |> Seq.map (fun t -> [{ s with text = t }])
+                let lastSeg = { s with text = parts |> Seq.last }
+                let closed = Seq.append [Seq.append cur [first] |> Seq.freeze] middle
+                (Seq.append lines closed |> Seq.freeze, [lastSeg])) ([], [])
+    Seq.append lines [cur] |> Seq.freeze
+
+/// paint one line's segments ($fill expanded against `width`); `color`
+/// false yields plain text
+let paintLine : bool -> seq<string * string> -> int -> seq<Seg> -> string
+
+let paintLine color palette width line =
+    let segs = expandFill width line
+    if not color then
+        segs |> Seq.map (fun g -> g.text) |> Str.join ""
+    else
+        let (parts, last) =
+            segs
+            |> Seq.fold (fun (acc, prev) g ->
+                let p = resolvePaint palette prev g
+                (Seq.append acc [transition prev p + g.text] |> Seq.freeze, p)) ([], paintPlain)
+        (parts |> Str.join "") + (if isPlain last then "" else $"{esc}[0m")
+
+/// paint segments into prompt lines
+let paint : bool -> seq<string * string> -> int -> seq<Seg> -> seq<string>
+
+let paint color palette width segs =
+    splitLines segs |> Seq.map (paintLine color palette width) |> Seq.freeze

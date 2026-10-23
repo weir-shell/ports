@@ -1,0 +1,772 @@
+module LangB
+
+// language modules L–Z (src/modules/<name>.rs). Same shape as LangA: the
+// row-generic helpers read any <Lang>Config, defaulting each field to the
+// configs/<name>.rs value; a module adds its own variables.
+
+import "../config.weir" as C
+import "../fmt.weir" as F
+import "../ctx.weir" as X
+
+/// the defaults of a standard language module (configs/<name>.rs Default)
+type LangDefaults = {
+    format: string
+    versionFormat: string
+    symbol: string
+    style: string
+    exts: seq<string>
+    files: seq<string>
+    folders: seq<string>
+}
+
+/// ~/.rustup/settings.toml (only version "12" is trusted, as starship does)
+type RustupSettings = {
+    default_host_triple: Option<string>
+    default_toolchain: Option<string>
+    overrides: Option<seq<string * string>>
+    version: Option<string>
+}
+
+type ToolchainSection = { channel: Option<string> }
+
+type ToolchainFile = { toolchain: ToolchainSection }
+
+/// rustup's answer for the overriding toolchain (RustupRunRustcVersionOutcome)
+type RustcOutcome =
+    | RustcVersion of string
+    | NotInstalled of string
+    | Unknown
+    | NotWorking
+    | Failed
+
+let stdFormat = "via [$symbol($version )]($style)"
+
+let defaults sym st exts files folders =
+    { format = stdFormat; versionFormat = "v${raw}"; symbol = sym; style = st; exts = exts; files = files; folders = folders }
+
+// ---- row-generic config access ---------------------------------------------
+
+let get cfg f dv = cfg |> Option.bind f |> Option.defaultValue dv
+
+let isDisabled cfg = get cfg (fun c -> c.disabled) false
+
+let detects ctx cfg d =
+    X.scan ctx (get cfg (fun c -> c.detect_files) d.files) (get cfg (fun c -> c.detect_extensions) d.exts) (get cfg (fun c -> c.detect_folders) d.folders)
+
+let vfmtOf cfg d = get cfg (fun c -> c.version_format) d.versionFormat
+
+// render with the config's format/symbol/style; `vars` resolves the rest
+let out cfg d vars =
+    X.render (get cfg (fun c -> c.format) d.format) (get cfg (fun c -> c.symbol) d.symbol) (get cfg (fun c -> c.style) d.style) vars
+
+// the standard module: `raw` gets the unformatted version (only called when
+// the format references $version)
+let lang ctx cfg d raw =
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "version" -> raw ctx |> Option.map (X.version vfmt) |> Option.bind X.plain
+            | _ -> None)
+
+// get_command_string_output: stdout, or stderr when stdout is empty
+let strOut o = if o.stdout == "" then o.stderr else o.stdout
+
+let word n s = Str.fields s |> Seq.tryItem n
+
+let firstLine s = Str.split "\n" s |> Seq.tryHead
+
+// a string-or-array config value (VecOr<string>)
+let strings y dv =
+    match y with
+    | Some (YStr s) -> [s]
+    | Some (YSeq items) -> items |> Seq.choose (function | YStr s -> Some s | _ -> None) |> Seq.freeze
+    | _ -> dv
+
+// ---- modules ------------------------------------------------------------------
+
+/// lua: `<lua_binary> -v`
+let lua : Ctx -> seq<Seg>
+
+let lua ctx =
+    let cfg = ctx.cfg.lua
+    let d = defaults "🌙 " "bold blue" ["lua"] [".lua-version"] ["lua"]
+    let bin = get cfg (fun c -> c.lua_binary) "lua"
+    lang ctx cfg d (fun c -> X.exec c bin ["-v"] |> Option.map strOut |> Option.bind (word 1))
+
+let mavenVersion props =
+    Str.split "\n" props
+    |> Seq.tryFind (Str.startsWith "distributionUrl=")
+    |> Option.bind (Str.tryRsplitOnce "/")
+    |> Option.map snd
+    |> Option.bind (fun f -> if Str.startsWith "apache-maven-" f then Some f[13..] else None)
+    |> Option.bind (Str.tryRsplitOnce "-")
+    |> Option.map fst
+
+/// maven: the version pinned in .mvn/wrapper/maven-wrapper.properties
+let maven : Ctx -> seq<Seg>
+
+let maven ctx =
+    let cfg = ctx.cfg.maven
+    let d = defaults "🅼 " "bold bright-cyan" [] ["pom.xml"] []
+    let props dir = X.readFile $"{dir}/.mvn/wrapper/maven-wrapper.properties"
+    let here = if Seq.contains ".mvn" ctx.folders then props ctx.cwd else None
+    let wrapper =
+        match here with
+        | Some p -> Some p
+        | None ->
+            if get cfg (fun c -> c.recursive) false then
+                X.ancestors ctx.cwd |> Seq.tryFind (fun a -> Dir.exists $"{a}/.mvn") |> Option.bind props
+            else None
+    if isDisabled cfg then X.none
+    elif wrapper == None && not (detects ctx cfg d) then X.none
+    else
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "version" -> wrapper |> Option.bind mavenVersion |> Option.map (X.version vfmt) |> Option.bind X.plain
+            | _ -> None)
+
+/// mojo: `mojo --version` → version and hash
+let mojo : Ctx -> seq<Seg>
+
+let mojo ctx =
+    let cfg = ctx.cfg.mojo
+    let d = { defaults "🔥 " "bold 208" ["mojo"; "🔥"] [] [] with format = "with [$symbol($version )]($style)" }
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        let parts = X.execOut ctx "mojo" ["--version"] |> Option.map (fun s -> Str.fields s |> Seq.freeze) |> Option.defaultValue []
+        let n = Seq.length parts
+        out cfg d (fun v ->
+            match v with
+            | "version" -> if n >= 2 then X.plain parts[1] else None
+            | "hash" -> if n >= 3 then X.plain parts[2] else None
+            | _ -> None)
+
+/// nim: the first all-digits-and-dots word of `nim --version`'s first line
+let nim : Ctx -> seq<Seg>
+
+let nim ctx =
+    let d = defaults "👑 " "yellow bold" ["nim"; "nims"; "nimble"] ["nim.cfg"] []
+    lang ctx ctx.cfg.nim d (fun c ->
+        X.exec c "nim" ["--version"]
+        |> Option.bind (fun o -> firstLine o.stdout)
+        |> Option.bind (fun l -> Str.split " " l |> Seq.tryFind (Str.isMatch @"^[0-9.]*$")))
+
+// ---- nodejs: engines.node is a Rust-semver requirement --------------------------
+
+let verKey (a, b, c) = a * 1000000000000 + b * 1000000 + c
+
+// one comparator of a Rust semver VersionReq; None = unparseable
+let comparatorOk v comp =
+    match Str.trim comp with
+    | Regex @"^(=|>=|<=|>|<|~|\^)?\s*(\d+|\*|x|X)(?:\.(\d+|\*|x|X))?(?:\.(\d+|\*|x|X))?$" (op, ma, mi, pa) ->
+        let num s = if s == "" || s == "*" || s == "x" || s == "X" then None else Some (Str.toInt s)
+        let me = verKey v
+        match num ma with
+        | None -> Some true
+        | Some i ->
+            let j = num mi
+            let k = num pa
+            let jv = j |> Option.defaultValue 0
+            let kv = k |> Option.defaultValue 0
+            let lo = verKey (i, jv, kv)
+            // the exclusive upper bound of the partial version
+            let upPartial =
+                if j == None then verKey (i + 1, 0, 0)
+                elif k == None then verKey (i, jv + 1, 0)
+                else verKey (i, jv, kv + 1)
+            let caret =
+                if i > 0 then (lo, verKey (i + 1, 0, 0))
+                elif j == None then (lo, verKey (1, 0, 0))
+                elif jv > 0 then (lo, verKey (0, jv + 1, 0))
+                elif k == None then (lo, verKey (0, 1, 0))
+                else (lo, verKey (0, 0, kv + 1))
+            let inRange (a, b) = me >= a && me < b
+            match op with
+            | "=" -> Some (inRange (lo, upPartial))
+            | ">" -> Some (me >= upPartial)
+            | ">=" -> Some (me >= lo)
+            | "<" -> Some (me < lo)
+            | "<=" -> Some (me < upPartial)
+            | "~" ->
+                let up = if j == None then verKey (i + 1, 0, 0) else verKey (i, jv + 1, 0)
+                Some (inRange (lo, up))
+            | _ -> Some (inRange caret)
+    | _ -> None
+
+// check_engines_version: true unless both versions parse and miss
+let enginesOk node engines =
+    match (node, engines) with
+    | (Some nv, Some req) ->
+        match nv with
+        | Regex @"(\d+)\.(\d+)\.(\d+)" (a, b, c) ->
+            let v = (Str.toInt a, Str.toInt b, Str.toInt c)
+            let results = Str.split "," req |> Seq.map (comparatorOk v) |> Seq.freeze
+            if Str.trim req == "" then true
+            elif results |> Seq.exists (fun r -> match r with | None -> true | _ -> false) then true
+            else results |> Seq.forall (fun r -> r == Some true)
+        | _ -> true
+    | _ -> true
+
+let enginesOf ctx =
+    X.readLocal ctx "package.json"
+    |> Option.bind (fun j -> [j] |> from json {| engines: Option<{| node: Option<string> |}> |} |> try)
+    |> Option.bind (fun p -> p.engines)
+    |> Option.bind (fun e -> e.node)
+
+/// nodejs: `node --version`, styled not_capable_style outside engines.node
+let nodejs : Ctx -> seq<Seg>
+
+let nodejs ctx =
+    let cfg = ctx.cfg.nodejs
+    let d = defaults " " "bold green" ["js"; "mjs"; "cjs"; "ts"; "mts"; "cts"] ["package.json"; ".node-version"; ".nvmrc"; "!bunfig.toml"; "!bun.lock"; "!bun.lockb"; "!deno.json"; "!deno.jsonc"; "!deno.lock"] ["node_modules"]
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) || Seq.contains "esy.lock" ctx.folders then X.none
+    else
+        let fmt = get cfg (fun c -> c.format) d.format
+        let wants = F.variables fmt |> Seq.freeze
+        let node = if Seq.contains "version" wants || Seq.contains "engines_version" wants || Str.contains "$style" fmt then X.exec ctx "node" ["--version"] |> Option.map (fun o -> o.stdout) else None
+        let engines = enginesOf ctx
+        let ok = enginesOk node engines
+        let style = if ok then get cfg (fun c -> c.style) d.style else get cfg (fun c -> c.not_capable_style) "bold red"
+        let vfmt = vfmtOf cfg d
+        X.render fmt (get cfg (fun c -> c.symbol) d.symbol) style (fun n ->
+            match n with
+            | "version" -> node |> Option.map (fun v -> Str.trim (if Str.startsWith "v" v then v[1..] else v)) |> Option.map (X.version vfmt) |> Option.bind X.plain
+            | "engines_version" -> if ok then None else engines |> Option.bind X.plain
+            | _ -> None)
+
+/// ocaml: `ocaml -vnum` (`esy ocaml -vnum` in an esy project), opam switch
+let ocaml : Ctx -> seq<Seg>
+
+let ocaml ctx =
+    let cfg = ctx.cfg.ocaml
+    let d = { defaults "🐫 " "bold yellow" ["opam"; "ml"; "mli"; "re"; "rei"] ["dune"; "dune-project"; "jbuild"; "jbuild-ignore"; ".merlin"] ["_opam"; "esy.lock"] with format = @"via [$symbol($version )(\($switch_indicator$switch_name\) )]($style)" }
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        let fmt = get cfg (fun c -> c.format) d.format
+        let wants = F.variables fmt |> Seq.freeze
+        let switch =
+            if Seq.contains "switch_name" wants || Seq.contains "switch_indicator" wants then
+                X.execOut ctx "opam" ["switch"; "show"; "--safe"]
+                |> Option.bind (fun s ->
+                    if s == "" then None
+                    elif Str.startsWith "/" s then Some (true, Path.fileName s)
+                    else Some (false, s))
+            else None
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "switch_indicator" ->
+                switch |> Option.map (fun (local, _) -> F.Meta (if local then get cfg (fun c -> c.local_switch_indicator) "*" else get cfg (fun c -> c.global_switch_indicator) ""))
+            | "switch_name" -> switch |> Option.bind (fun (_, name) -> X.plain name)
+            | "version" ->
+                let v = if Seq.contains "esy.lock" ctx.folders then X.execOut ctx "esy" ["ocaml"; "-vnum"] else X.execOut ctx "ocaml" ["-vnum"]
+                v |> Option.map (X.version vfmt) |> Option.bind X.plain
+            | _ -> None)
+
+/// odin: the last word of `odin version` (commit hash cut unless show_commit)
+let odin : Ctx -> seq<Seg>
+
+let odin ctx =
+    let cfg = ctx.cfg.odin
+    let d = defaults "Ø " "bold bright-blue" ["odin"] [] []
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        out cfg d (fun n ->
+            match n with
+            | "version" ->
+                X.exec ctx "odin" ["version"]
+                |> Option.bind (fun o -> Str.split " " o.stdout |> Seq.tryLast)
+                |> Option.map Str.trim
+                |> Option.map (fun v -> if get cfg (fun c -> c.show_commit) false then v else Str.split ":" v |> Seq.head |> Str.trim)
+                |> Option.bind X.plain
+            | _ -> None)
+
+/// opa: `opa version`, second word
+let opa : Ctx -> seq<Seg>
+
+let opa ctx =
+    let d = defaults "🪖 " "bold blue" ["rego"] [] []
+    lang ctx ctx.cfg.opa d (fun c -> X.exec c "opa" ["version"] |> Option.map strOut |> Option.bind (word 1))
+
+/// perl: `perl -e 'printf q#%vd#,$^V;'`
+let perl : Ctx -> seq<Seg>
+
+let perl ctx =
+    let d = { defaults "🐪 " "149 bold" ["pl"; "pm"; "pod"] ["Makefile.PL"; "Build.PL"; "cpanfile"; "cpanfile.snapshot"; "META.json"; "META.yml"; ".perl-version"] [] with style = "149 bold" }
+    lang ctx ctx.cfg.perl d (fun c -> X.exec c "perl" ["-e"; "printf q#%vd#,$^V;"] |> Option.map (fun o -> o.stdout))
+
+/// php: PHP_MAJOR.MINOR.RELEASE via `php -nr`
+let php : Ctx -> seq<Seg>
+
+let php ctx =
+    let d = defaults "🐘 " "147 bold" ["php"] ["composer.json"; ".php-version"] []
+    lang ctx ctx.cfg.php d (fun c -> X.exec c "php" ["-nr"; "echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION.\".\".PHP_RELEASE_VERSION;"] |> Option.map (fun o -> o.stdout))
+
+/// pixi: shown in a pixi project or when PIXI_ENVIRONMENT_NAME is set
+let pixi : Ctx -> seq<Seg>
+
+let pixi ctx =
+    let cfg = ctx.cfg.pixi
+    let d = { defaults "🧚 " "yellow bold" [] ["pixi.toml"; "pixi.lock"] [] with format = @"via [$symbol($version )(\($environment\) )]($style)" }
+    let envName = Env.get "PIXI_ENVIRONMENT_NAME"
+    if isDisabled cfg then X.none
+    elif envName == None && not (detects ctx cfg d) then X.none
+    else
+        let shownEnv = if (not (get cfg (fun c -> c.show_default_environment) true)) && envName == Some "default" then None else envName
+        let bins = strings (cfg |> Option.bind (fun c -> c.pixi_binary)) ["pixi"]
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "environment" -> shownEnv |> Option.bind X.plain
+            | "project_name" -> Env.get "PIXI_PROJECT_NAME" |> Option.bind X.plain
+            | "version" ->
+                bins
+                |> Seq.tryPick (fun b -> X.exec ctx b ["--version"])
+                |> Option.map strOut
+                |> Option.bind (Str.trySplitOnce " ")
+                |> Option.map (fun (_, v) -> Str.trim v)
+                |> Option.map (X.version vfmt)
+                |> Option.bind X.plain
+            | _ -> None)
+
+/// purescript: `purs --version`
+let purescript : Ctx -> seq<Seg>
+
+let purescript ctx =
+    let d = defaults "<=> " "bold white" ["purs"] ["spago.dhall"; "spago.yaml"; "spago.lock"] []
+    lang ctx ctx.cfg.purescript d (fun c -> X.execOut c "purs" ["--version"])
+
+// ---- python ---------------------------------------------------------------------
+
+// python_binary: a string, a list of strings, or a list of command lists
+let pythonBinaries y =
+    match y with
+    | Some (YStr s) -> [[s]]
+    | Some (YSeq items) ->
+        items
+        |> Seq.map (fun i ->
+            match i with
+            | YStr s -> [s]
+            | YSeq xs -> xs |> Seq.choose (function | YStr s -> Some s | _ -> None) |> Seq.freeze
+            | _ -> [])
+        |> Seq.freeze
+    | _ -> [["python"]; ["python3"]; ["python2"]]
+
+// pyvenv.cfg's general-section `prompt`, parens stripped
+let venvPrompt venv =
+    X.readFile $"{venv}/pyvenv.cfg"
+    |> Option.bind (fun text ->
+        Str.split "\n" text
+        |> Seq.takeWhile (fun l -> not (Str.startsWith "[" (Str.trim l)))
+        |> Seq.tryPick (fun l ->
+            match Str.trySplitOnce "=" l with
+            | Some (k, v) when Str.trim k == "prompt" -> Some (Str.trim v)
+            | _ -> None))
+    |> Option.map (fun p -> p |> Str.rmatch @"^[()]*(.*?)[()]*$" |> Option.map (fun g -> g[0]) |> Option.defaultValue p)
+
+let venvName generic venv =
+    let dirName p =
+        let f = Path.fileName (if Str.endsWith "/" p && p <> "/" then p[..^2] else p)
+        if f == "" then None else Some f
+    venvPrompt venv
+    |> Option.orElse (dirName venv)
+    |> Option.bind (fun name ->
+        if Seq.contains name generic then dirName (Path.dir venv) else Some name)
+
+/// python: version from python_binary, virtualenv name, optional pyenv name
+let python : Ctx -> seq<Seg>
+
+let python ctx =
+    let cfg = ctx.cfg.python
+    let d = { defaults "🐍 " "yellow bold" ["py"; "ipynb"] ["requirements.txt"; ".python-version"; "pyproject.toml"; "Pipfile"; "tox.ini"; "setup.py"; "__init__.py"] [] with format = @"via [${symbol}${pyenv_prefix}(${version} )(\($virtualenv\) )]($style)" }
+    let envVars = get cfg (fun c -> c.detect_env_vars) ["VIRTUAL_ENV"]
+    let hasEnv = not (Seq.isEmpty envVars) && X.envDetect envVars
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) && not hasEnv then X.none
+    else
+        let pyenv = get cfg (fun c -> c.pyenv_version_name) false
+        let prefix = if pyenv then get cfg (fun c -> c.pyenv_prefix) "pyenv " else ""
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "version" ->
+                if pyenv then
+                    Env.get "PYENV_VERSION" |> Option.orElseWith (fun () -> X.execOut ctx "pyenv" ["version-name"]) |> Option.bind X.plain
+                else
+                    pythonBinaries (cfg |> Option.bind (fun c -> c.python_binary))
+                    |> Seq.tryPick (fun b ->
+                        match b with
+                        | cmd :: args -> X.exec ctx cmd (Seq.append args ["--version"] |> Seq.freeze)
+                        | [] -> None)
+                    |> Option.map strOut
+                    |> Option.bind (word 1)
+                    |> Option.map (X.version vfmt)
+                    |> Option.bind X.plain
+            | "virtualenv" ->
+                Env.get "VIRTUAL_ENV"
+                |> Option.bind (venvName (get cfg (fun c -> c.generic_venv_names) []))
+                |> Option.map Str.trim
+                |> Option.bind X.plain
+            | "pyenv_prefix" -> X.plain prefix
+            | _ -> None)
+
+/// quarto: `quarto --version`
+let quarto : Ctx -> seq<Seg>
+
+let quarto ctx =
+    let d = defaults "⨁ " "bold #75AADB" ["qmd"] ["_quarto.yml"] []
+    lang ctx ctx.cfg.quarto d (fun c -> X.exec c "quarto" ["--version"] |> Option.map (fun o -> Str.trimEnd o.stdout))
+
+/// raku: language version and VM from `raku --version`
+let raku : Ctx -> seq<Seg>
+
+let raku ctx =
+    let cfg = ctx.cfg.raku
+    let d = { defaults "🦋 " "149 bold" ["p6"; "pm6"; "pod6"; "raku"; "rakumod"] ["META6.json"] [] with format = "via [$symbol($version-$vm_version )]($style)"; versionFormat = "${raw}" }
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        let parsed =
+            X.exec ctx "raku" ["--version"]
+            |> Option.bind (fun o ->
+                let ls = Str.split "\n" o.stdout |> Seq.freeze
+                let lang = ls |> Seq.tryItem 1 |> Option.bind (word 5) |> Option.bind (fun w -> if Str.endsWith "." w then Some w[..^2] else None)
+                let vm = ls |> Seq.tryItem 2 |> Option.bind (word 2) |> Option.map (Str.replace "MoarVM" "Moar")
+                match (lang, vm) with
+                | (Some l, Some v) -> Some (Str.toLower l, Str.toLower v)
+                | _ -> None)
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "version" -> parsed |> Option.map (fun (l, _) -> X.version vfmt l) |> Option.bind X.plain
+            | "vm_version" -> parsed |> Option.bind (fun (_, v) -> X.plain v)
+            | _ -> None)
+
+/// red: `red --version`
+let red : Ctx -> seq<Seg>
+
+let red ctx =
+    let d = defaults "🔺 " "red bold" ["red"; "reds"] [] []
+    lang ctx ctx.cfg.red d (fun c -> X.execOut c "red" ["--version"])
+
+/// rlang: third word of `R --version`'s first line
+let rlang : Ctx -> seq<Seg>
+
+let rlang ctx =
+    let d = defaults "📐 " "blue bold" ["R"; "Rd"; "Rmd"; "Rproj"; "Rsx"] ["DESCRIPTION"] [".Rproj.user"]
+    lang ctx ctx.cfg.rlang d (fun c -> X.exec c "R" ["--version"] |> Option.map strOut |> Option.bind firstLine |> Option.bind (word 2))
+
+/// ruby: `ruby -v` (patchlevel cut), rvm gemset
+let ruby : Ctx -> seq<Seg>
+
+let ruby ctx =
+    let cfg = ctx.cfg.ruby
+    let d = defaults "💎 " "bold red" ["rb"] ["Gemfile"; ".ruby-version"] []
+    let isEnv = get cfg (fun c -> c.detect_variables) ["RUBY_VERSION"; "RBENV_VERSION"] |> Seq.exists (fun v -> Env.get v <> None)
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) && not isEnv then X.none
+    else
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "version" ->
+                X.exec ctx "ruby" ["-v"]
+                |> Option.bind (fun o -> word 1 o.stdout)
+                |> Option.map (fun v -> Str.split "p" v |> Seq.head)
+                |> Option.map (X.version vfmt)
+                |> Option.bind X.plain
+            | "gemset" ->
+                X.exec ctx "rvm" ["current"]
+                |> Option.bind (fun o -> Str.rmatch @"@(\S+)" o.stdout)
+                |> Option.bind (fun g -> X.plain g[0])
+            | _ -> None)
+
+// ---- rust -----------------------------------------------------------------------
+
+let rustupHome ctx =
+    match Env.get "RUSTUP_HOME" with
+    | Some h -> if Str.startsWith "/" h then h else Path.combine ctx.cwd h
+    | None -> $"{ctx.home}/.rustup"
+
+let rustupSettings ctx =
+    X.readFile $"{rustupHome ctx}/settings.toml"
+    |> Option.bind (fun t -> [t] |> from toml RustupSettings |> try)
+    |> Option.bind (fun s -> if s.version == Some "12" then Some s else None)
+
+let underDir cwd dir =
+    let d = if Str.endsWith "/" dir && dir <> "/" then dir[..^2] else dir
+    cwd == d || d == "/" || Str.startsWith (d + "/") cwd
+
+let depth p = Str.split "/" p |> Seq.where (fun s -> s <> "") |> Seq.length
+
+let lookupOverride settings cwd =
+    settings
+    |> Option.bind (fun s -> s.overrides)
+    |> Option.defaultValue []
+    |> Seq.where (fun (dir, _) -> underDir cwd dir)
+    |> Seq.sortByDescending (fun (dir, _) -> depth dir)
+    |> Seq.tryHead
+    |> Option.map snd
+
+// rust-toolchain (one line) or rust-toolchain.toml ([toolchain] channel)
+let readChannel path onlyToml =
+    X.readFile path
+    |> Option.bind (fun text ->
+        let n = Str.split "\n" text |> Seq.where (fun l -> l <> "") |> Seq.length
+        if n == 0 then None
+        elif n == 1 && not onlyToml then Some text
+        else [text] |> from toml ToolchainFile |> try |> Option.bind (fun f -> f.toolchain.channel))
+    |> Option.map Str.trim
+    |> Option.bind (fun c -> if c == "" then None else Some c)
+
+let toolchainFile ctx =
+    X.ancestors ctx.cwd
+    |> Seq.tryPick (fun d -> readChannel $"{d}/rust-toolchain" false |> Option.orElseWith (fun () -> readChannel $"{d}/rust-toolchain.toml" true))
+
+let envToolchain ctx settings =
+    Env.get "RUSTUP_TOOLCHAIN"
+    |> Option.map Str.trim
+    |> Option.orElseWith (fun () -> lookupOverride settings ctx.cwd)
+    |> Option.orElseWith (fun () -> toolchainFile ctx)
+    |> Option.orElseWith (fun () -> settings |> Option.bind (fun s -> s.default_toolchain))
+    |> Option.orElseWith (fun () -> X.exec ctx "rustup" ["default"] |> Option.bind (fun o -> word 0 o.stdout))
+
+// `<rustup>/toolchains/<tc>/bin/rustc --version`, else `rustup run <tc> rustc --version`
+let rustupRustc ctx tc =
+    let direct = $"{rustupHome ctx}/toolchains/{tc}/bin/rustc"
+    let (prog, args) = if File.exists direct then (direct, ["--version"]) else ("rustup", ["run"; tc; "rustc"; "--version"])
+    match $(^$prog $@args | complete) |> try with
+    | None -> NotWorking
+    | Some r ->
+        let stderr = r.stderr |> Str.join "\n"
+        if r.exitCode == 0 then RustcVersion (r.stdout |> Str.join "\n")
+        else
+            match stderr with
+            | Regex @"^error: toolchain '(.*)' is not installed$" name -> NotInstalled name
+            | _ -> Failed
+
+let rustcVerbose ctx settings =
+    let prog = "rustc"
+    match $(^$prog -Vv | complete) |> try with
+    | Some r when r.exitCode == 0 ->
+        let line pre = r.stdout |> Seq.tryFind (Str.startsWith pre) |> Option.map (fun l -> l[(Str.length pre)..])
+        match (line "release: ", line "host: ") with
+        | (Some release, Some host) ->
+            let semver = Str.split "-" release |> Seq.head
+            Some ($"v{semver}", settings |> Option.bind (fun s -> s.default_toolchain) |> Option.defaultValue host)
+        | _ -> None
+    | _ -> None
+
+let guessHostTriple ctx =
+    let arch = X.execOut ctx "uname" ["-m"] |> Option.defaultValue "x86_64"
+    match X.execOut ctx "uname" ["-s"] with
+    | Some "Darwin" -> Some $"{arch}-apple-darwin"
+    | Some "Linux" -> Some $"{arch}-unknown-linux-gnu"
+    | _ -> None
+
+let formatToolchain tc triple =
+    match triple with
+    | Some t when Str.endsWith $"-{t}" tc -> tc[..(Str.length tc - Str.length t - 2)]
+    | _ -> tc
+
+/// rust: version/numver/toolchain without triggering toolchain downloads
+let rust : Ctx -> seq<Seg>
+
+let rust ctx =
+    let cfg = ctx.cfg.rust
+    let d = defaults "🦀 " "bold red" ["rs"] ["Cargo.toml"] []
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        let fmt = get cfg (fun c -> c.format) d.format
+        let wants = F.variables fmt |> Seq.freeze
+        let needed = Seq.contains "version" wants || Seq.contains "numver" wants || Seq.contains "toolchain" wants
+        let settings = if needed then rustupSettings ctx else None
+        let tc = if needed then envToolchain ctx settings else None
+        let outcome =
+            if not needed then Unknown
+            else
+                match tc with
+                | Some t -> rustupRustc ctx t
+                | None -> Unknown
+        let vfmt = vfmtOf cfg d
+        let fallback () =
+            match outcome with
+            | NotWorking | Unknown -> rustcVerbose ctx settings
+            | _ -> None
+        out cfg d (fun n ->
+            match n with
+            | "version" ->
+                match outcome with
+                | RustcVersion v -> word 1 v |> Option.map (X.version vfmt) |> Option.bind X.plain
+                | NotInstalled name -> X.plain name
+                | Failed -> None
+                | _ ->
+                    X.exec ctx "rustc" ["--version"]
+                    |> Option.bind (fun o -> word 1 o.stdout)
+                    |> Option.map (X.version vfmt)
+                    |> Option.bind X.plain
+            | "numver" ->
+                match outcome with
+                | RustcVersion v ->
+                    let release = word 1 v |> Option.defaultValue v
+                    X.plain $"v{Str.split "-" release |> Seq.head}"
+                | NotInstalled _ -> None
+                | Failed -> None
+                | _ -> fallback () |> Option.bind (fun (numver, _) -> X.plain numver)
+            | "toolchain" ->
+                let triple = settings |> Option.bind (fun s -> s.default_host_triple) |> Option.orElseWith (fun () -> guessHostTriple ctx)
+                match outcome with
+                | RustcVersion _ -> tc |> Option.map (fun t -> formatToolchain t triple) |> Option.bind X.plain
+                | NotInstalled _ -> tc |> Option.map (fun t -> formatToolchain t triple) |> Option.bind X.plain
+                | Failed -> None
+                | _ -> fallback () |> Option.map (fun (_, t) -> formatToolchain t triple) |> Option.bind X.plain
+            | _ -> None)
+
+/// scala: `scala-cli version --scala`, else `scalac -version`
+let scala : Ctx -> seq<Seg>
+
+let scala ctx =
+    let d = defaults "🆂 " "red bold" ["sbt"; "scala"] [".scalaenv"; ".sbtenv"; "build.sbt"] [".metals"]
+    lang ctx ctx.cfg.scala d (fun c ->
+        X.exec c "scala-cli" ["version"; "--scala"]
+        |> Option.bind (fun o -> if o.stdout == "" then None else Some (Str.trim o.stdout))
+        |> Option.orElseWith (fun () -> X.exec c "scalac" ["-version"] |> Option.map strOut |> Option.bind (word 3)))
+
+/// solidity: `<compiler> --version` (solc or solcjs)
+let solidity : Ctx -> seq<Seg>
+
+let solidity ctx =
+    let cfg = ctx.cfg.solidity
+    let d = { defaults "S " "bold blue" ["sol"] [] [] with format = "via [$symbol($version)]($style)"; versionFormat = "v${major}.${minor}.${patch}" }
+    let compilers = strings (cfg |> Option.bind (fun c -> c.compiler)) ["solc"]
+    lang ctx cfg d (fun c ->
+        compilers
+        |> Seq.tryPick (fun b -> X.exec c b ["--version"])
+        |> Option.map strOut
+        |> Option.map (fun v -> word 7 v |> Option.defaultValue v)
+        |> Option.map (fun v -> Str.split "+" v |> Seq.head))
+
+let swiftVersion s =
+    let ws = Str.fields s |> Seq.freeze
+    ws |> Seq.indexed |> Seq.tryFind (fun (_, w) -> w == "version") |> Option.bind (fun (i, _) -> ws |> Seq.tryItem (i + 1))
+
+/// swift: `swift-frontend --version`, else `swift --version`
+let swift : Ctx -> seq<Seg>
+
+let swift ctx =
+    let d = defaults "🐦 " "bold 202" ["swift"] ["Package.swift"] []
+    lang ctx ctx.cfg.swift d (fun c ->
+        X.exec c "swift-frontend" ["--version"]
+        |> Option.bind (fun o -> swiftVersion o.stdout)
+        |> Option.orElseWith (fun () -> X.exec c "swift" ["--version"] |> Option.bind (fun o -> swiftVersion o.stdout)))
+
+let tfVersion l =
+    let a = if Str.startsWith "Terraform " l then l[10..] else l
+    let b = if Str.startsWith "OpenTofu " a then a[9..] else a
+    let t = Str.trim b
+    if Str.startsWith "v" t then t[1..] else t
+
+/// terraform: workspace (TF_WORKSPACE, else <data dir>/environment) and version
+let terraform : Ctx -> seq<Seg>
+
+let terraform ctx =
+    let cfg = ctx.cfg.terraform
+    let d = { defaults "💠 " "bold 105" ["tf"; "tofu"; "tfplan"; "tfstate"] [] [".terraform"] with format = "via [$symbol$workspace]($style) " }
+    if isDisabled cfg then X.none
+    elif not (detects ctx cfg d) then X.none
+    else
+        let vfmt = vfmtOf cfg d
+        out cfg d (fun n ->
+            match n with
+            | "version" ->
+                X.execFirst ctx (get cfg (fun c -> c.commands) [["terraform"; "version"]; ["tofu"; "version"]])
+                |> Option.bind (fun o -> firstLine o.stdout)
+                |> Option.map tfVersion
+                |> Option.map (X.version vfmt)
+                |> Option.bind X.plain
+            | "workspace" ->
+                match Env.get "TF_WORKSPACE" with
+                | Some w -> X.plain w
+                | None ->
+                    let dataDir = Env.get "TF_DATA_DIR" |> Option.defaultValue $"{ctx.cwd}/.terraform"
+                    let envFile = $"{dataDir}/environment"
+                    if File.exists envFile then X.readFile envFile |> Option.bind X.plain
+                    elif Dir.exists envFile then None
+                    else X.plain "default"
+            | _ -> None)
+
+/// typst: `typst --version`
+let typst : Ctx -> seq<Seg>
+
+let typst ctx =
+    let d = defaults "t " "bold #0093A7" ["typ"] ["template.typ"] []
+    lang ctx ctx.cfg.typst d (fun c ->
+        X.execOut c "typst" ["--version"]
+        |> Option.bind (fun s -> if Str.startsWith "typst " s then word 0 s[6..] else None))
+
+/// vagrant: `vagrant --version`
+let vagrant : Ctx -> seq<Seg>
+
+let vagrant ctx =
+    let d = defaults "⍱ " "cyan bold" [] ["Vagrantfile"] []
+    lang ctx ctx.cfg.vagrant d (fun c -> X.exec c "vagrant" ["--version"] |> Option.bind (fun o -> word 1 o.stdout))
+
+/// vlang: `v version`
+let vlang : Ctx -> seq<Seg>
+
+let vlang ctx =
+    let d = defaults "V " "blue bold" ["v"] ["v.mod"; "vpkg.json"; ".vpkg-lock.json"] []
+    lang ctx ctx.cfg.vlang d (fun c -> X.exec c "v" ["version"] |> Option.bind (fun o -> word 1 o.stdout))
+
+/// xmake: `xmake --version`, `v` and `+build` cut
+let xmake : Ctx -> seq<Seg>
+
+let xmake ctx =
+    let d = defaults "△ " "bold green" [] ["xmake.lua"] []
+    lang ctx ctx.cfg.xmake d (fun c ->
+        X.exec c "xmake" ["--version"]
+        |> Option.bind (fun o -> word 1 o.stdout)
+        |> Option.map (fun w -> if Str.startsWith "v" w then w[1..] else w)
+        |> Option.map (fun w -> Str.split "+" w |> Seq.head))
+
+/// this file's modules, by starship name
+let modules : seq<string * (Ctx -> seq<Seg>)>
+
+let modules = [
+    ("lua", lua)
+    ("maven", maven)
+    ("mojo", mojo)
+    ("nim", nim)
+    ("nodejs", nodejs)
+    ("ocaml", ocaml)
+    ("odin", odin)
+    ("opa", opa)
+    ("perl", perl)
+    ("php", php)
+    ("pixi", pixi)
+    ("purescript", purescript)
+    ("python", python)
+    ("quarto", quarto)
+    ("raku", raku)
+    ("red", red)
+    ("rlang", rlang)
+    ("ruby", ruby)
+    ("rust", rust)
+    ("scala", scala)
+    ("solidity", solidity)
+    ("swift", swift)
+    ("terraform", terraform)
+    ("typst", typst)
+    ("vagrant", vagrant)
+    ("vlang", vlang)
+    ("xmake", xmake)
+]

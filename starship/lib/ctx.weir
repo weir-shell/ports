@@ -1,0 +1,254 @@
+module Ctx
+
+// starship's Context (src/context/mod.rs): the per-prompt facts every module
+// reads — the parsed config, the scanned current directory, the last
+// entry's status — plus the shared helpers (scan, exec, version format,
+// module rendering).
+
+import "./config.weir" as C
+import "./fmt.weir" as F
+
+/// what one prompt render knows
+type Ctx = {
+    cfg: Starship
+    /// the working directory (weir's own; `cd` moves it)
+    cwd: string
+    home: string
+    /// names of the plain files directly in cwd
+    files: seq<string>
+    /// names of the directories directly in cwd
+    folders: seq<string>
+    /// every extension seen in cwd (`foo.tar.gz` adds `gz` and `tar.gz`)
+    exts: seq<string>
+    /// the previous entry succeeded
+    ok: bool
+    /// the previous bare command's exit code
+    exit: Option<int>
+    width: int
+    color: bool
+    palette: seq<string * string>
+    timeout: Duration
+}
+
+/// the output of a successful command
+type Out = {
+    stdout: string
+    stderr: string
+}
+
+/// an empty config: every module at its defaults
+let emptyConfig : unit -> Starship
+
+let emptyConfig () = [""] |> from toml Starship
+
+/// STARSHIP_CONFIG, else ~/.config/starship.toml
+let configPath : unit -> string
+
+let configPath () =
+    Env.get "STARSHIP_CONFIG" |> Option.defaultValue $"{Env.get "HOME" |> Option.defaultWith Path.home}/.config/starship.toml"
+
+/// the config at `path` (a missing or broken file means the defaults; the
+/// error goes to stderr, as starship logs it)
+let loadConfig : string -> Starship
+
+let loadConfig path =
+    if not (File.exists path) then
+        emptyConfig ()
+    else
+        match File.read path |> from toml Starship |> try result with
+        | Ok c -> c
+        | Error e ->
+            printerr $"starship: {path}: {e}"
+            emptyConfig ()
+
+let yamlInt y =
+    match y with
+    | YInt n -> Some n
+    | _ -> None
+
+let extsOf name =
+    if Str.startsWith "." name then []
+    else
+        let last = Path.extension name
+        let lastExt = if last == "" then [] else [last[1..]]
+        let full =
+            match Str.trySplitOnce "." name with
+            | Some (_, after) -> [after]
+            | None -> []
+        Seq.append lastExt full |> Seq.distinct |> Seq.freeze
+
+/// build the context for the directory `dir`
+let make : Starship -> string -> bool -> Option<int> -> Ctx
+
+let make cfg dir ok code =
+    let rows = Dir.stat dir |> try |> Option.defaultValue [] |> Seq.freeze
+    let isDir r = r.kind == Directory || (r.kind == Symlink && Dir.exists r.path)
+    let files = rows |> Seq.where (fun r -> not (isDir r)) |> Seq.map (fun r -> r.name) |> Seq.freeze
+    let palette =
+        match cfg.palette with
+        | Some name ->
+            cfg.palettes
+            |> Option.defaultValue []
+            |> Seq.tryFind (fun (k, _) -> k == name)
+            |> Option.map snd
+            |> Option.defaultValue []
+        | None -> []
+    {
+        cfg = cfg
+        cwd = dir
+        home = Env.get "HOME" |> Option.defaultWith Path.home
+        files = files
+        folders = rows |> Seq.where isDir |> Seq.map (fun r -> r.name) |> Seq.freeze
+        exts = files |> Seq.collect extsOf |> Seq.distinct |> Seq.freeze
+        ok = ok
+        exit = code
+        width = Term.width ()
+        color = Env.get "NO_COLOR" |> Option.map (fun _ -> false) |> Option.defaultValue true
+        palette = palette |> Seq.freeze
+        timeout = cfg.command_timeout |> Option.bind yamlInt |> Option.defaultValue 500 |> Duration.ms
+    }
+
+// ---- directory scanning (ScanDir) ------------------------------------------
+
+let positive xs has = xs |> Seq.exists (fun x -> not (Str.startsWith "!" x) && has x)
+let noNegative xs has = not (xs |> Seq.exists (fun x -> Str.startsWith "!" x && has x[1..]))
+
+/// starship's ScanDir.is_match: any positive file/extension/folder present,
+/// and no `!negated` one
+let scan : Ctx -> seq<string> -> seq<string> -> seq<string> -> bool
+
+let scan ctx files exts folders =
+    let hasFile f = Seq.contains f ctx.files
+    let hasExt e = Seq.contains e ctx.exts
+    let hasFolder d = Seq.contains d ctx.folders
+    let clean = noNegative exts hasExt && noNegative files hasFile && noNegative folders hasFolder
+    clean && (positive exts hasExt || positive files hasFile || positive folders hasFolder)
+
+/// detect_env_vars: empty passes; a set `!NAME` fails; else any NAME set
+let envDetect : seq<string> -> bool
+
+let envDetect vars =
+    if Seq.isEmpty vars then true
+    elif vars |> Seq.exists (fun v -> Str.startsWith "!" v && Env.get v[1..] <> None) then false
+    else
+        let pos = vars |> Seq.where (fun v -> not (Str.startsWith "!" v)) |> Seq.freeze
+        Seq.isEmpty pos || (pos |> Seq.exists (fun v -> Env.get v <> None))
+
+/// a file in cwd, read whole (None unless the scan saw it)
+let readLocal : Ctx -> string -> Option<string>
+
+let readLocal ctx name =
+    if Seq.contains name ctx.files then
+        File.read (Path.combine ctx.cwd name) |> Str.join "\n" |> try
+    else None
+
+/// a file anywhere, read whole
+let readFile : string -> Option<string>
+
+let readFile p =
+    if File.exists p then File.read p |> Str.join "\n" |> try else None
+
+/// dir, its parent, ..., the root
+let ancestors : string -> seq<string>
+
+let ancestors dir =
+    let parts = Str.split "/" dir |> Seq.where (fun p -> p <> "") |> Seq.freeze
+    let n = Seq.length parts
+    let up = [0..(n - 1)] |> Seq.map (fun k -> "/" + (parts |> Seq.take (n - k) |> Str.join "/"))
+    Seq.append up ["/"] |> Seq.freeze
+
+/// the nearest ancestor (cwd included) holding `name` (file or dir)
+let findUp : string -> string -> Option<string>
+
+let findUp dir name =
+    ancestors dir
+    |> Seq.tryFind (fun d ->
+        let p = Path.combine d name
+        File.exists p || Dir.exists p)
+
+// ---- commands ---------------------------------------------------------------
+
+/// starship's exec_cmd: run with the command_timeout; None when the program
+/// is missing, exits nonzero, or times out
+let exec : Ctx -> string -> seq<string> -> Option<Out>
+
+let exec ctx cmd args =
+    [0; 1]
+    |> Seq.pfirst (fun i ->
+        if i == 0 then
+            $(^$cmd $@args | complete)
+            |> try
+            |> Option.bind (fun r ->
+                if r.exitCode == 0 then Some { stdout = r.stdout |> Str.join "\n"; stderr = r.stderr |> Str.join "\n" }
+                else None)
+        else
+            Duration.sleep ctx.timeout
+            None)
+
+/// the first command (a [program; args...] list) that succeeds
+let execFirst : Ctx -> seq<seq<string>> -> Option<Out>
+
+let execFirst ctx cmds =
+    cmds
+    |> Seq.tryPick (fun c ->
+        match c with
+        | prog :: args -> exec ctx prog args
+        | [] -> None)
+
+/// stdout, trimmed
+let execOut : Ctx -> string -> seq<string> -> Option<string>
+
+let execOut ctx cmd args = exec ctx cmd args |> Option.map (fun o -> Str.trim o.stdout)
+
+// ---- formatting ---------------------------------------------------------------
+
+/// VersionFormatter: `${raw}`, `${major}`, `${minor}`, `${patch}`
+let version : string -> string -> string
+
+let version fmt raw =
+    let parts = Str.split "." (Str.trimStart raw) |> Seq.freeze
+    let nth i =
+        parts
+        |> Seq.tryItem i
+        |> Option.bind (fun p ->
+            match p with
+            | Regex @"^(\d+)" d -> Some d
+            | _ -> None)
+    let vars n =
+        match n with
+        | "raw" -> Some (F.Plain raw)
+        | "major" -> nth 0 |> Option.map F.Plain
+        | "minor" -> nth 1 |> Option.map F.Plain
+        | "patch" -> nth 2 |> Option.map F.Plain
+        | _ -> None
+    F.render vars (fun _ -> None) fmt |> Seq.map (fun s -> s.text) |> Str.join ""
+
+/// render a module format: `$symbol` (a meta format) and `$style` are the
+/// standard variables; `vars` resolves the rest
+let render : string -> string -> string -> (string -> Option<Value>) -> seq<Seg>
+
+let render fmt symbol style vars =
+    let lookup n =
+        match n with
+        | "symbol" -> Some (F.Meta symbol)
+        | _ -> vars n
+    let styleVars n = if n == "style" then Some style else None
+    F.render lookup styleVars fmt
+
+/// a plain variable that is present only when non-empty
+let plain : string -> Option<Value>
+
+let plain s = if s == "" then None else Some (F.Plain s)
+
+/// a module that renders nothing
+let none : seq<Seg>
+
+let none = []
+
+/// `~`-relative display of a path under home
+let contractHome : Ctx -> string -> string
+
+let contractHome ctx p =
+    if p == ctx.home then "~"
+    elif Str.startsWith (ctx.home + "/") p then "~" + p[Str.length ctx.home..]
+    else p

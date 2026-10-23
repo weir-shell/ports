@@ -1,0 +1,133 @@
+#!/usr/bin/env weir
+// whole-prompt oracle: build fixture directories and configs, render
+// `starship prompt` with the real binary and with the port, compare bytes.
+// Needs a reference binary: --starship <path>.
+
+type Cli = {
+    /// the reference starship binary
+    starship: string
+}
+
+type Case = {
+    name: string
+    dir: string
+    config: string
+    status: int
+}
+
+let cli = Args.load Cli
+let root = Self.scriptPath |> Path.dir |> Path.dir
+let bin = Path.combine root "bin/starship.weir"
+
+let gitc = ["-c"; "user.name=t"; "-c"; "user.email=t@t"; "-c"; "init.defaultBranch=main"]
+
+within tmp d
+    let fx p = Path.combine d p
+    // a polyglot git repo with every kind of change
+    let repo = fx "repo"
+    Dir.create repo
+    within cd repo
+        git $@gitc init -q
+        ["{\"name\": \"app\", \"version\": \"1.4.2\"}"] |> File.write "package.json"
+        ["[package]"; "name = \"app\""; "version = \"0.3.0\""] |> File.write "Cargo.toml"
+        ["print(1)"] |> File.write "main.py"
+        ["a"] |> File.write "tracked.txt"
+        ["b"] |> File.write "gone.txt"
+        git $@gitc add -A
+        git $@gitc commit -qm init
+        ["a2"] |> File.write "tracked.txt"
+        File.delete "gone.txt"
+        ["new"] |> File.write "staged.txt"
+        git add staged.txt
+        ["u"] |> File.write "untracked.txt"
+    let sub = fx "repo/deep/er/still"
+    Dir.create sub
+    let plain = fx "plain"
+    Dir.create plain
+    ["module x"] |> File.write (Path.combine plain "go.mod")
+    ["x"] |> File.write (Path.combine plain "main.zig")
+
+    let cfg name lines =
+        let p = fx $"{name}.toml"
+        lines |> File.write p
+        p
+    let empty = cfg "empty" [""]
+    let rich =
+        cfg "rich" [
+            "format = \"\"\"$username$directory$git_branch$git_status$fill$nodejs$python$rust$line_break$status$character\"\"\""
+            "[username]"
+            "show_always = true"
+            "format = '[$user]($style) in '"
+            "[directory]"
+            "truncation_length = 2"
+            "style = 'bold fg:#ff8800'"
+            "[git_status]"
+            "format = '([\\[$all_status$ahead_behind\\]]($style) )'"
+            "modified = 'M${count}'"
+            "[fill]"
+            "symbol = '·'"
+            "style = 'bright-black'"
+            "[status]"
+            "disabled = false"
+            "[character]"
+            "success_symbol = '[λ](bold green)'"
+            "error_symbol = '[λ](bold red)'"
+        ]
+    let customs =
+        cfg "customs" [
+            "add_newline = false"
+            "format = '$directory${custom.hello}$custom$env_var$character'"
+            "[custom.hello]"
+            "command = 'echo hi'"
+            "when = true"
+            "style = 'purple'"
+            "[custom.zigonly]"
+            "command = 'echo zig-here'"
+            "detect_extensions = ['zig']"
+            "[env_var.WEIR_ORACLE_X]"
+            "default = 'unset'"
+            "format = '[$env_value]($style) '"
+        ]
+    let palette =
+        cfg "palette" [
+            "palette = 'mine'"
+            "format = '[$directory](bg:base)[](fg:base)$character'"
+            "[palettes.mine]"
+            "base = '#334455'"
+            "[directory]"
+            "style = 'fg:accent bg:base'"
+            "[palettes.other]"
+            "accent = 'red'"
+        ]
+
+    let cases = [
+        { name = "default repo"; dir = repo; config = empty; status = 0 }
+        { name = "default repo, failed"; dir = repo; config = empty; status = 1 }
+        { name = "default subdir"; dir = sub; config = empty; status = 0 }
+        { name = "default plain"; dir = plain; config = empty; status = 0 }
+        { name = "default tmp root"; dir = d; config = empty; status = 130 }
+        { name = "rich repo"; dir = repo; config = rich; status = 0 }
+        { name = "rich subdir, failed"; dir = sub; config = rich; status = 2 }
+        { name = "customs plain"; dir = plain; config = customs; status = 0 }
+        { name = "customs repo"; dir = repo; config = customs; status = 0 }
+        { name = "palette"; dir = plain; config = palette; status = 0 }
+    ]
+
+    let results =
+        cases
+        |> Seq.map (fun c ->
+            let st = $"{c.status}"
+            let conf = c.config
+            let here = c.dir
+            let want =
+                within cd c.dir
+                    within env STARSHIP_CONFIG=$conf PWD=$here COLUMNS="80"
+                        ^$cli.starship prompt --status $st | text
+            let got = weir $bin prompt --path $c.dir --config $c.config --status $c.status | text
+            (c.name, want, got))
+        |> Seq.freeze
+    let bad = results |> Seq.where (fun (_, w, g) -> w <> g) |> Seq.freeze
+    for (n, w, g) in bad do
+        printerr $"MISMATCH {n}\n  want {show w}\n  got  {show g}"
+    print $"prompt oracle: {Seq.length results - Seq.length bad}/{Seq.length results} match"
+    if not (Seq.isEmpty bad) then exit 1
