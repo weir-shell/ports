@@ -20,6 +20,7 @@ and runs it, so a red build is the migration-work signal for the next release
 | [`acme/`](./acme) | acme.sh (ACME/Let's Encrypt client) | HTTP · JSON · Bytes/base64url · crypto | HTTP layer **230 → 33 lines**; JWS envelope **openssl-oracle-verified**; RFC-7638 thumbprints byte-match |
 | [`ring/`](./ring) | ring (.NET process orchestrator) | supervision · concurrency · lifecycle · signals | a process supervisor on `Proc.spawn`/`poll`; the FSM as a **30-line `match`**; state file-backed → `status` from a second process, no server |
 | [`dbt/`](./dbt) | dbt (arquidevio monorepo build tool, F#) | monorepo discovery · git-diff change detection · CE-DSL → records · `from xml` | the `plan{}` computation-expression DSL → **plain records** (~40% fewer lines, "a plan is just a value"); **real-dbt oracle byte-identical**; `Graph.reach` eats the 4th hand-rolled walk-up; the `plan`-keyword collision (dbt's build-`Plan` vs weir's dry-run `plan`) |
+| [`starship/`](./starship) | starship (Rust cross-shell prompt) | format-string DSL · ANSI painting · config schema → types · parallel modules · git/cloud/toolchain probes | **all 113 modules** as a weir REPL prompt reading your `starship.toml`; **byte-identical** to starship 1.27.0 on 215 oracle cases; a recursive-descent formatter becomes **one fold over a frame stack** |
 
 Each is a **Stage 1** slice — a coherent, runnable proof, not a complete port —
 with a Stage-2 estimate in its FINDINGS.

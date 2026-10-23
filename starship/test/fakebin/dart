@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Dart SDK version: 3.1.0 (stable) (Tue Aug 15 21:33:36 2023 +0000) on \"linux_x64\"" >&2

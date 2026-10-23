@@ -5,6 +5,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -45,7 +46,7 @@ jobs:
             else
               echo "FAIL $f"; weir check "$f" 2>&1 | sed 's/^/     /'; fail=1
             fi
-          done < <(find asdf acme ring dbt -name '*.weir' -not -path '*/probes/*' | sort)
+          done < <(find asdf acme ring dbt starship -type f -name '*.weir' -not -path '*/probes/*' -not -path '*/.weir/*' | sort)
           exit $fail
 
       - name: asdf harness
@@ -70,3 +71,14 @@ jobs:
           weir test/harness.weir
           weir test/harness2.weir
           weir test/harness2-tekton.weir
+
+      # starship: byte-for-byte against the real binary (pinned release)
+      - name: starship oracle
+        working-directory: starship
+        run: |
+          mkdir -p "$RUNNER_TEMP/starship"
+          curl -fsSL https://github.com/starship/starship/releases/download/v1.27.0/starship-x86_64-unknown-linux-musl.tar.gz | tar xz -C "$RUNNER_TEMP/starship"
+          S="$RUNNER_TEMP/starship/starship"
+          weir test/oracle_fmt.weir --starship "$S"
+          weir test/oracle.weir --starship "$S"
+          weir test/oracle_modules.weir --starship "$S"

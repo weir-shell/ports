@@ -1,0 +1,512 @@
+module LangA
+
+// language modules A–K (src/modules/<name>.rs). The standard shape —
+// detect by files/extensions/folders, run a version command, format
+// "via [$symbol($version )]($style)" — is `lang`; a module supplies its
+// config, its defaults and how to get the raw version.
+
+import "../config.weir" as C
+import "../fmt.weir" as F
+import "../ctx.weir" as X
+
+/// the defaults of a standard language module (configs/<name>.rs Default)
+type LangADefaults = {
+    format: string
+    versionFormat: string
+    symbol: string
+    style: string
+    exts: seq<string>
+    files: seq<string>
+    folders: seq<string>
+}
+
+let stdFormat = "via [$symbol($version )]($style)"
+
+let ccFormat = "via [$symbol($version(-$name) )]($style)"
+
+let defaults symbol style exts files folders =
+    { format = stdFormat; versionFormat = "v${raw}"; symbol = symbol; style = style; exts = exts; files = files; folders = folders }
+
+// row-generic over every <Lang>Config record: the user's value when set,
+// else the default
+let pick cfg f dv = cfg |> Option.bind f |> Option.defaultValue dv
+
+// a module the user disabled renders nothing (print.rs checks this
+// centrally; `starship module` alone skips the check)
+let detected ctx cfg d =
+    let enabled = not (pick cfg (fun c -> c.disabled) false)
+    enabled && X.scan ctx (pick cfg (fun c -> c.detect_files) d.files) (pick cfg (fun c -> c.detect_extensions) d.exts) (pick cfg (fun c -> c.detect_folders) d.folders)
+
+// the general shape: detection, then `vars vfmt name` resolves the
+// module's own variables ($symbol/$style are standard)
+let langVars ctx cfg d vars =
+    if not (detected ctx cfg d) then X.none
+    else
+        let vfmt = pick cfg (fun c -> c.version_format) d.versionFormat
+        X.render (pick cfg (fun c -> c.format) d.format) (pick cfg (fun c -> c.symbol) d.symbol) (pick cfg (fun c -> c.style) d.style) (vars vfmt)
+
+// the standard shape: `raw` gets the unformatted version (called only when
+// the format references $version)
+let lang ctx cfg d raw =
+    langVars ctx cfg d (fun vfmt n ->
+        match n with
+        | "version" -> raw ctx |> Option.map (X.version vfmt) |> Option.bind X.plain
+        | _ -> None)
+
+// the n-th whitespace-separated word
+let word n s = Str.fields s |> Seq.tryItem n
+
+// stdout, or stderr when stdout is empty (utils::get_command_string_output)
+let outOrErr o = if o.stdout == "" then o.stderr else o.stdout
+
+let semverPat = @"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+
+// the first word that parses as a semver (semver::Version::parse)
+let firstSemver s = Str.fields s |> Seq.tryFind (Str.isMatch semverPat)
+
+// a top-level string key of a YAML document
+let yamlKey key text =
+    match Yaml.parse (Str.split "\n" text) |> try with
+    | Some (YMap pairs) ->
+        pairs
+        |> Seq.tryFind (fun (k, _) -> k == key)
+        |> Option.bind (fun (_, v) ->
+            match v with
+            | YStr s -> Some s
+            | _ -> None)
+    | _ -> None
+
+/// buf: `buf --version`, first word
+let buf : Ctx -> seq<Seg>
+
+let buf ctx =
+    let d = { defaults "🐃 " "bold blue" [] ["buf.yaml"; "buf.gen.yaml"; "buf.work.yaml"] [] with format = "with [$symbol($version )]($style)" }
+    lang ctx ctx.cfg.buf d (fun c -> X.execOut c "buf" ["--version"] |> Option.bind (word 0))
+
+/// bun: `bun --version`
+let bun : Ctx -> seq<Seg>
+
+let bun ctx =
+    let d = defaults "🥟 " "bold red" [] ["bun.lock"; "bun.lockb"; "bunfig.toml"] []
+    lang ctx ctx.cfg.bun d (fun c -> X.execOut c "bun" ["--version"])
+
+// c and cpp (cc.rs): the first working compiler command; $name from its
+// banner, $version its first semver word
+let cc ctx cfg d commands compilers =
+    if pick cfg (fun c -> c.disabled) false then X.none
+    else
+        langVars ctx cfg d (fun vfmt ->
+            let info = X.execFirst ctx (pick cfg (fun c -> c.commands) commands) |> Option.map (fun o -> o.stdout)
+            fun n ->
+                match n with
+                | "name" ->
+                    info |> Option.bind (fun i -> compilers |> Seq.tryFind (fun (_, hint) -> Str.contains hint i) |> Option.map (fun (name, _) -> F.Plain name))
+                | "version" -> info |> Option.bind firstSemver |> Option.map (X.version vfmt) |> Option.bind X.plain
+                | _ -> None)
+
+/// c: cc/gcc/clang
+let c : Ctx -> seq<Seg>
+
+let c ctx =
+    let d = { defaults "C " "149 bold" ["c"; "h"] [] [] with format = ccFormat }
+    cc ctx ctx.cfg.c d [["cc"; "--version"]; ["gcc"; "--version"]; ["clang"; "--version"]] [("clang", "clang"); ("gcc", "Free Software Foundation")]
+
+/// cpp: c++/g++/clang++ (disabled by default)
+let cpp : Ctx -> seq<Seg>
+
+let cpp ctx =
+    let d = { defaults "C++ " "149 bold" ["cpp"; "cc"; "cxx"; "c++"; "hpp"; "hh"; "hxx"; "h++"; "tcc"] [] [] with format = ccFormat }
+    let disabled = ctx.cfg.cpp |> Option.bind (fun c -> c.disabled) |> Option.defaultValue true
+    if disabled then X.none
+    else cc ctx ctx.cfg.cpp d [["c++"; "--version"]; ["g++"; "--version"]; ["clang++"; "--version"]] [("clang++", "clang"); ("g++", "Free Software Foundation")]
+
+/// cmake: `cmake --version`, third word
+let cmake : Ctx -> seq<Seg>
+
+let cmake ctx =
+    let d = defaults "△ " "bold blue" [] ["CMakeLists.txt"; "CMakeCache.txt"] []
+    lang ctx ctx.cfg.cmake d (fun c -> X.execOut c "cmake" ["--version"] |> Option.bind (word 2))
+
+/// cobol: `cobc -version`, third word
+let cobol : Ctx -> seq<Seg>
+
+let cobol ctx =
+    let d = defaults "⚙️ " "bold blue" ["cbl"; "cob"; "CBL"; "COB"] [] []
+    lang ctx ctx.cfg.cobol d (fun c -> X.execOut c "cobc" ["-version"] |> Option.bind (word 2))
+
+/// crystal: `crystal --version`, second word
+let crystal : Ctx -> seq<Seg>
+
+let crystal ctx =
+    let d = defaults "🔮 " "bold red" ["cr"] ["shard.yml"] []
+    lang ctx ctx.cfg.crystal d (fun c -> X.execOut c "crystal" ["--version"] |> Option.bind (word 1))
+
+/// daml: $DAML_SDK_VERSION, else daml.yaml's sdk-version
+let daml : Ctx -> seq<Seg>
+
+let daml ctx =
+    let d = defaults "Λ " "bold cyan" [] ["daml.yaml"] []
+    lang ctx ctx.cfg.daml d (fun c -> Env.get "DAML_SDK_VERSION" |> Option.orElseWith (fun () -> X.readLocal c "daml.yaml" |> Option.bind (yamlKey "sdk-version")))
+
+/// dart: `dart --version` (stdout or stderr), fourth word
+let dart : Ctx -> seq<Seg>
+
+let dart ctx =
+    let d = defaults "🎯 " "bold blue" ["dart"] ["pubspec.yaml"; "pubspec.yml"; "pubspec.lock"] [".dart_tool"]
+    lang ctx ctx.cfg.dart d (fun c -> X.exec c "dart" ["--version"] |> Option.map outOrErr |> Option.bind (word 3))
+
+/// deno: `deno -V`, second word
+let deno : Ctx -> seq<Seg>
+
+let deno ctx =
+    let d = defaults "🦕 " "green bold" [] ["deno.json"; "deno.jsonc"; "deno.lock"; "mod.ts"; "deps.ts"; "mod.js"; "deps.js"] []
+    lang ctx ctx.cfg.deno d (fun c -> X.execOut c "deno" ["-V"] |> Option.bind (word 1))
+
+// ---- dotnet ----------------------------------------------------------------
+
+type DotnetKind =
+    | ProjectJson
+    | ProjectFile
+    | GlobalJson
+    | SolutionFile
+    | MsBuildFile
+
+let dotnetKind name =
+    let lower = Str.toLower name
+    if lower == "global.json" then Some GlobalJson
+    elif lower == "project.json" then Some ProjectJson
+    else
+        match Path.extension lower with
+        | ".sln" -> Some SolutionFile
+        | ".csproj" | ".fsproj" | ".xproj" -> Some ProjectFile
+        | ".props" | ".targets" -> Some MsBuildFile
+        | _ -> None
+
+let pinnedSdk path =
+    X.readFile path
+    |> Option.bind (fun t -> [t] |> from json {| sdk: Option<{| version: Option<string> |}> |} |> try)
+    |> Option.bind (fun j -> j.sdk)
+    |> Option.bind (fun s -> s.version)
+
+let dotnetCli ctx = X.execOut ctx "dotnet" ["--version"]
+
+let latestSdk ctx =
+    match X.exec ctx "dotnet" ["--list-sdks"] with
+    | Some o ->
+        Str.split "\n" o.stdout
+        |> Seq.map Str.trim
+        |> Seq.where (fun l -> l <> "")
+        |> Seq.tryLast
+        |> Option.bind (fun l -> Str.tryIndexOf "[" l |> Option.bind (fun i -> if i - 1 > 1 then Some l[..(i - 2)] else None))
+    | None -> dotnetCli ctx
+
+let nearbyGlobalJson cwd root =
+    let parent = if root == Some cwd then [] else (if cwd == "/" then [] else [Path.dir cwd])
+    let dirs = Seq.append parent (root |> Option.map (fun r -> [r]) |> Option.defaultValue []) |> Seq.distinct |> Seq.where (fun d -> d <> cwd)
+    dirs |> Seq.tryPick (fun d -> pinnedSdk (Path.combine d "global.json"))
+
+let estimateDotnet ctx files =
+    let ofKind k = files |> Seq.tryFind (fun (_, t) -> t == k)
+    let relevant = ofKind GlobalJson |> Option.orElse (ofKind SolutionFile) |> Option.orElse (files |> Seq.tryHead)
+    match relevant with
+    | Some (p, GlobalJson) -> pinnedSdk p |> Option.orElseWith (fun () -> latestSdk ctx)
+    | Some (_, SolutionFile) -> latestSdk ctx
+    | Some _ ->
+        let root = X.findUp ctx.cwd ".git"
+        nearbyGlobalJson ctx.cwd root |> Option.orElseWith (fun () -> latestSdk ctx)
+    | None -> None
+
+let tfmOf path =
+    X.readFile path
+    |> Option.bind (fun t ->
+        match t with
+        | Regex @"<TargetFrameworks?>\s*([^<]*?)\s*<" v when v <> "" -> Some v
+        | _ -> None)
+
+/// dotnet: the SDK pinned by global.json (heuristic), else the CLI; $tfm
+/// from the project file
+let dotnet : Ctx -> seq<Seg>
+
+let dotnet ctx =
+    let cfg = ctx.cfg.dotnet
+    let d = { defaults ".NET " "blue bold" ["csproj"; "fsproj"; "xproj"] ["global.json"; "project.json"; "Directory.Build.props"; "Directory.Build.targets"; "Packages.props"] [] with format = "via [$symbol($version )(🎯 $tfm )]($style)" }
+    if not (detected ctx cfg d) then X.none
+    else
+        let files = ctx.files |> Seq.choose (fun f -> dotnetKind f |> Option.map (fun k -> (Path.combine ctx.cwd f, k))) |> Seq.freeze
+        let heuristic = pick cfg (fun c -> c.heuristic) true
+        let vfmt = pick cfg (fun c -> c.version_format) d.versionFormat
+        let symbol = pick cfg (fun c -> c.symbol) d.symbol
+        let vars n =
+            match n with
+            | "symbol" -> Some (F.Plain symbol)
+            | "version" ->
+                (if heuristic then estimateDotnet ctx files else dotnetCli ctx) |> Option.map (X.version vfmt) |> Option.map F.Plain
+            | "tfm" -> files |> Seq.tryFind (fun (_, k) -> k == ProjectFile) |> Option.bind (fun (p, _) -> tfmOf p) |> Option.map F.Plain
+            | _ -> None
+        let style = pick cfg (fun c -> c.style) d.style
+        F.render vars (fun n -> if n == "style" then Some style else None) (pick cfg (fun c -> c.format) d.format)
+
+/// elixir: `elixir --version` gives $otp_version (line 1) and $version (line 3)
+let elixir : Ctx -> seq<Seg>
+
+let elixir ctx =
+    let d = { defaults "💧 " "bold purple" [] ["mix.exs"] [] with format = @"via [$symbol($version \(OTP $otp_version\) )]($style)" }
+    langVars ctx ctx.cfg.elixir d (fun vfmt ->
+        let fmt = pick ctx.cfg.elixir (fun c -> c.format) d.format
+        let used = F.variables fmt |> Seq.exists (fun v -> v == "version" || v == "otp_version")
+        let versions =
+            if not used then None
+            else
+                X.execOut ctx "elixir" ["--version"]
+                |> Option.bind (fun out ->
+                    let ls = Str.split "\n" out |> Seq.freeze
+                    match (ls |> Seq.tryItem 0 |> Option.bind (word 1), ls |> Seq.tryItem 2 |> Option.bind (word 1)) with
+                    | (Some otp, Some ex) -> Some (otp, ex)
+                    | _ -> None)
+        fun n ->
+            match n with
+            | "version" -> versions |> Option.map (fun (_, ex) -> F.Plain (X.version vfmt ex))
+            | "otp_version" -> versions |> Option.map (fun (otp, _) -> F.Plain otp)
+            | _ -> None)
+
+/// elm: `elm --version`
+let elm : Ctx -> seq<Seg>
+
+let elm ctx =
+    let d = defaults "🌳 " "cyan bold" ["elm"] ["elm.json"; "elm-package.json"; ".elm-version"] ["elm-stuff"]
+    lang ctx ctx.cfg.elm d (fun c -> X.execOut c "elm" ["--version"])
+
+/// erlang: the OTP_VERSION file, via erl
+let erlang : Ctx -> seq<Seg>
+
+let erlang ctx =
+    let d = defaults " " "bold red" [] ["rebar.config"; "erlang.mk"] []
+    let script = "Fn=filename:join([code:root_dir(),\"releases\",erlang:system_info(otp_release),\"OTP_VERSION\"]),{ok,Content}=file:read_file(Fn),io:format(\"~s\",[Content]),halt(0)."
+    lang ctx ctx.cfg.erlang d (fun c -> X.execOut c "erl" ["-noshell"; "-eval"; script])
+
+/// fennel: `fennel --version` (stdout or stderr), second word
+let fennel : Ctx -> seq<Seg>
+
+let fennel ctx =
+    let d = defaults "🧅 " "bold green" ["fnl"] [] []
+    lang ctx ctx.cfg.fennel d (fun c -> X.exec c "fennel" ["--version"] |> Option.map outOrErr |> Option.bind (word 1))
+
+/// fortran: gfortran/flang
+let fortran : Ctx -> seq<Seg>
+
+let fortran ctx =
+    let cfg = ctx.cfg.fortran
+    let d = { defaults "🅵  " "bold purple" ["f"; "F"; "for"; "FOR"; "ftn"; "FTN"; "f77"; "F77"; "f90"; "F90"; "f95"; "F95"; "f03"; "F03"; "f08"; "F08"; "f18"; "F18"] ["fpm.toml"] [] with format = ccFormat; versionFormat = "${raw}" }
+    langVars ctx cfg d (fun vfmt ->
+        let info = X.execFirst ctx (pick cfg (fun c -> c.commands) [["gfortran"; "--version"]; ["flang"; "--version"]; ["flang-new"; "--version"]]) |> Option.map (fun o -> o.stdout)
+        fun n ->
+            match n with
+            | "name" ->
+                info |> Option.bind (fun i -> if Str.contains "GNU" i then Some (F.Plain "gfortran") elif Str.contains "flang" i then Some (F.Plain "flang") else None)
+            | "version" -> info |> Option.bind firstSemver |> Option.map (X.version vfmt) |> Option.bind X.plain
+            | _ -> None)
+
+/// gleam: `gleam --version`, last word
+let gleam : Ctx -> seq<Seg>
+
+let gleam ctx =
+    let d = defaults "⭐ " "bold #FFAFF3" ["gleam"] ["gleam.toml"] []
+    lang ctx ctx.cfg.gleam d (fun c -> X.execOut c "gleam" ["--version"] |> Option.bind (fun o -> Str.fields o |> Seq.tryLast))
+
+// ---- golang ----------------------------------------------------------------
+
+let nums s = Str.split "." s |> Seq.map Str.toInt |> Seq.freeze
+
+// semver::VersionReq::parse(mod) (a bare version is a caret requirement)
+// matching semver::Version::parse(go); anything unparsable passes
+let goCapable goVer modVer =
+    match (goVer, modVer) with
+    | (Some g, Some m) when Str.isMatch @"^\d+\.\d+\.\d+$" g && Str.isMatch @"^\d+(\.\d+){0,2}$" m ->
+        let v = nums g
+        let r = nums m
+        let (vM, vm, vp) = (v[0], v[1], v[2])
+        let rM = r[0]
+        let rm = r |> Seq.tryItem 1
+        let rp = r |> Seq.tryItem 2
+        let atLeast = vM > rM || (vM == rM && (vm > (rm |> Option.defaultValue 0) || (vm == (rm |> Option.defaultValue 0) && vp >= (rp |> Option.defaultValue 0))))
+        let upper =
+            if rM > 0 then vM == rM
+            else
+                match rm with
+                | None -> vM == 0
+                | Some mi when mi > 0 -> vM == 0 && vm == mi
+                | Some mi ->
+                    match rp with
+                    | None -> vM == 0 && vm == mi
+                    | Some pa -> vM == 0 && vm == mi && vp == pa
+        atLeast && upper
+    | _ -> true
+
+/// golang: `go version`; $mod_version (go.mod's `go` line) shows when the
+/// toolchain does not satisfy it, painted not_capable_style
+let golang : Ctx -> seq<Seg>
+
+let golang ctx =
+    let cfg = ctx.cfg.golang
+    let d = defaults "🐹 " "bold cyan" ["go"] ["go.mod"; "go.sum"; "go.work"; "glide.yaml"; "Gopkg.yml"; "Gopkg.lock"; ".go-version"] ["Godeps"]
+    if not (detected ctx cfg d) then X.none
+    else
+        let fmt = pick cfg (fun c -> c.format) d.format
+        let goVer =
+            X.exec ctx "go" ["version"]
+            |> Option.bind (fun o -> Str.trySplitOnce "go version go" o.stdout)
+            |> Option.bind (fun (_, rest) -> word 0 rest)
+        let modVer =
+            X.readLocal ctx "go.mod"
+            |> Option.bind (fun t ->
+                match t with
+                | Regex @"(?:go\s)(\d+(?:\.\d+)+)" v -> Some v
+                | _ -> None)
+        let capable = goCapable goVer modVer
+        let vfmt = pick cfg (fun c -> c.version_format) d.versionFormat
+        let style = if capable then pick cfg (fun c -> c.style) d.style else pick cfg (fun c -> c.not_capable_style) "bold red"
+        let vars n =
+            match n with
+            | "symbol" -> Some (F.Meta (pick cfg (fun c -> c.symbol) d.symbol))
+            | "version" -> goVer |> Option.map (fun g -> F.Plain (X.version vfmt g))
+            | "mod_version" -> if capable then None else modVer |> Option.map F.Plain
+            | _ -> None
+        F.render vars (fun n -> if n == "style" then Some style else None) fmt
+
+/// gradle: the wrapper's distributionUrl (gradle/wrapper/gradle-wrapper.properties)
+let gradle : Ctx -> seq<Seg>
+
+let gradle ctx =
+    let cfg = ctx.cfg.gradle
+    let d = defaults "🅶 " "bold bright-cyan" ["gradle"; "gradle.kts"] [] ["gradle"]
+    let props dir = X.readFile (Path.combine dir "gradle/wrapper/gradle-wrapper.properties")
+    let wrapper c =
+        let here = if Seq.contains "gradle" c.folders then props c.cwd else None
+        let up () = if pick cfg (fun x -> x.recursive) false then X.ancestors c.cwd |> Seq.skip 1 |> Seq.tryPick props else None
+        here |> Option.orElseWith up
+    let parse text =
+        Str.split "\n" text
+        |> Seq.tryFind (Str.startsWith "distributionUrl=")
+        |> Option.bind (Str.tryRsplitOnce "/")
+        |> Option.bind (fun (_, file) -> if Str.startsWith "gradle-" file then Some file[7..] else None)
+        |> Option.bind (Str.tryRsplitOnce "-")
+        |> Option.map fst
+    lang ctx cfg d (fun c -> wrapper c |> Option.bind parse)
+
+/// haskell: the stack.yaml snapshot, else `ghc --numeric-version`
+let haskell : Ctx -> seq<Seg>
+
+let haskell ctx =
+    let cfg = ctx.cfg.haskell
+    let d = defaults "λ " "bold purple" ["hs"; "cabal"; "hs-boot"] ["stack.yaml"; "cabal.project"] []
+    let ghc () = X.execOut ctx "ghc" ["--numeric-version"]
+    let snapshot () =
+        if not (Seq.contains "stack.yaml" ctx.files) then None
+        else
+            X.readLocal ctx "stack.yaml"
+            |> Option.bind (fun t ->
+                let v = yamlKey "resolver" t |> Option.orElse (yamlKey "snapshot" t)
+                let ok = v |> Option.map (fun s -> Str.startsWith "lts" s || Str.startsWith "nightly" s || Str.startsWith "ghc" s) |> Option.defaultValue false
+                Some (if ok then v |> Option.defaultValue "" else "<custom snapshot>"))
+    langVars ctx cfg d (fun _ n ->
+        match n with
+        | "version" -> snapshot () |> Option.orElseWith ghc |> Option.map F.Plain
+        | "ghc_version" -> ghc () |> Option.map F.Plain
+        | _ -> None)
+
+/// haxe: .haxerc's version, else `haxe --version`
+let haxe : Ctx -> seq<Seg>
+
+let haxe ctx =
+    let d = defaults "⌘ " "bold fg:202" ["hx"; "hxml"] ["haxelib.json"; "hxformat.json"; ".haxerc"] [".haxelib"; "haxe_libraries"]
+    let haxerc c =
+        X.readLocal c ".haxerc"
+        |> Option.bind (fun t -> [t] |> from json {| version: Option<string> |} |> try)
+        |> Option.bind (fun j -> j.version)
+        |> Option.bind (fun v -> if Str.contains "/" v || Str.contains @"\" v then None else Some v)
+    let cli c =
+        X.exec c "haxe" ["--version"]
+        |> Option.bind (fun o -> if Str.isMatch @"(?:[0-9a-zA-Z][-+0-9.a-zA-Z]+)" o.stdout then Some (Str.trim o.stdout) else None)
+    lang ctx ctx.cfg.haxe d (fun c -> haxerc c |> Option.orElseWith (fun () -> cli c))
+
+/// helm: `helm version --short`, minus `v` and the `+build`
+let helm : Ctx -> seq<Seg>
+
+let helm ctx =
+    let d = defaults "⎈ " "bold white" [] ["helmfile.yaml"; "Chart.yaml"] []
+    let parse out =
+        let head = Str.trySplitOnce "+" out |> Option.map fst |> Option.defaultValue out
+        let noV = if Str.startsWith "v" head then (Str.rmatch @"^v*(.*)$" head |> Option.map (fun g -> g[0]) |> Option.defaultValue head) else head
+        Some (Str.trim noV)
+    lang ctx ctx.cfg.helm d (fun c -> X.exec c "helm" ["version"; "--short"] |> Option.bind (fun o -> parse o.stdout))
+
+/// java: `java -Xinternalversion` ($JAVA_HOME/bin/java when set)
+let java : Ctx -> seq<Seg>
+
+let java ctx =
+    let d = defaults "☕ " "red dimmed" ["java"; "class"; "jar"; "gradle"; "clj"; "cljc"] ["pom.xml"; "build.gradle.kts"; "build.sbt"; ".java-version"; "deps.edn"; "project.clj"; "build.boot"; ".sdkmanrc"] []
+    let bin = Env.get "JAVA_HOME" |> Option.map (fun h -> Path.combine (Path.combine h "bin") "java") |> Option.defaultValue "java"
+    let parse s =
+        match s with
+        | Regex @"(?:JRE.*\(|OpenJ9 )(\d+(?:\.\d+){0,2}).*, built on" v -> Some v
+        | _ -> None
+    lang ctx ctx.cfg.java d (fun c -> X.exec c bin ["-Xinternalversion"] |> Option.map outOrErr |> Option.bind parse)
+
+/// julia: `julia --version`
+let julia : Ctx -> seq<Seg>
+
+let julia ctx =
+    let d = defaults "ஃ " "bold purple" ["jl"] ["Project.toml"; "Manifest.toml"] []
+    lang ctx ctx.cfg.julia d (fun c -> X.execOut c "julia" ["--version"] |> Option.bind (Str.trySplitOnce "julia version") |> Option.bind (fun (_, rest) -> word 0 rest))
+
+/// kotlin: `<kotlin_binary> -version` (stdout or stderr)
+let kotlin : Ctx -> seq<Seg>
+
+let kotlin ctx =
+    let cfg = ctx.cfg.kotlin
+    let d = defaults "🅺 " "bold blue" ["kt"; "kts"] [] []
+    let bin = pick cfg (fun c -> c.kotlin_binary) "kotlin"
+    let parse s =
+        match s with
+        | Regex @"([\d\.]+[\d\.]+[\d\.]+)" v -> Some v
+        | _ -> None
+    lang ctx cfg d (fun c -> X.exec c bin ["-version"] |> Option.map outOrErr |> Option.bind parse)
+
+/// zig: `zig version`
+let zig : Ctx -> seq<Seg>
+
+let zig ctx =
+    let d = defaults "↯ " "bold yellow" ["zig"] [] []
+    lang ctx ctx.cfg.zig d (fun c -> X.execOut c "zig" ["version"])
+
+/// this file's modules, by starship name
+let modules : seq<string * (Ctx -> seq<Seg>)>
+
+let modules = [
+    ("buf", buf)
+    ("bun", bun)
+    ("c", c)
+    ("cmake", cmake)
+    ("cobol", cobol)
+    ("cpp", cpp)
+    ("crystal", crystal)
+    ("daml", daml)
+    ("dart", dart)
+    ("deno", deno)
+    ("dotnet", dotnet)
+    ("elixir", elixir)
+    ("elm", elm)
+    ("erlang", erlang)
+    ("fennel", fennel)
+    ("fortran", fortran)
+    ("gleam", gleam)
+    ("golang", golang)
+    ("gradle", gradle)
+    ("haskell", haskell)
+    ("haxe", haxe)
+    ("helm", helm)
+    ("java", java)
+    ("julia", julia)
+    ("kotlin", kotlin)
+    ("zig", zig)
+]

@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Nim Compiler Version 2.0.2 [Linux: amd64]"; echo "Compiled at 2024"

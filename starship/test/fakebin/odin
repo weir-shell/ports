@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "odin version dev-2024-03:fc587c507"

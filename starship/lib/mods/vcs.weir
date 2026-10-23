@@ -1,0 +1,970 @@
+module Vcs
+
+// version-control modules: git_* (src/modules/git_*.rs), hg_*, fossil_*,
+// pijul_channel, jj_* (src/context/jj_repo.rs), vcs and vcsh.
+//
+// starship reads git through gix; here discovery, HEAD, state and the stash
+// count are plain file reads, and only what needs the object database or the
+// index (status, metrics, describe, an attached HEAD's hash, upstream config)
+// runs the git CLI, timeout-bounded like starship's own git calls.
+
+import "../config.weir" as C
+import "../fmt.weir" as F
+import "../ctx.weir" as X
+
+/// a discovered git repository
+type Repo = {
+    /// the per-worktree git dir (HEAD, MERGE_HEAD, rebase-merge/ ...)
+    gitDir: string
+    /// the shared git dir (refs, logs, config) — gitDir unless a linked worktree
+    commonDir: string
+    /// the work tree root; None for a bare repository
+    workdir: Option<string>
+}
+
+/// git status --porcelain=2, counted the way starship's gix walk counts
+type GitCounts = {
+    conflicted: int
+    deleted: int
+    renamed: int
+    modified: int
+    staged: int
+    typechanged: int
+    untracked: int
+    worktreeAdded: int
+    worktreeDeleted: int
+    worktreeModified: int
+    worktreeTypechanged: int
+    indexAdded: int
+    indexDeleted: int
+    indexModified: int
+    indexTypechanged: int
+    ahead: Option<int>
+    behind: Option<int>
+}
+
+/// `jj show` template output (jj_repo.rs RawCurrentChange)
+type JjCurrent = {
+    has_description: bool
+    hidden: bool
+    immutable: bool
+    divergent: bool
+    change_offset: int
+    change_id: string
+    change_id_prefix_len: int
+    commit_id: string
+    commit_id_prefix_len: int
+    lines_added: int
+    lines_removed: int
+    statuses: string
+    conflicted: Option<bool>
+    bookmarks: Option<seq<string>>
+}
+
+type JjParents = {
+    conflicted: Option<bool>
+    bookmarks: Option<seq<string>>
+}
+
+type JjRaw = {
+    current: JjCurrent
+    parents: Option<JjParents>
+}
+
+/// jj_repo.rs CurrentChange
+type JjChange = {
+    change: string
+    changeShortest: int
+    commit: string
+    commitShortest: int
+    changeOffset: Option<int>
+    bookmarks: seq<string>
+    linesAdded: int
+    linesRemoved: int
+    conflictedFlag: bool
+    descriptionFlag: bool
+    hiddenFlag: bool
+    immutableFlag: bool
+    statuses: string
+}
+
+// a user value when the module table and the field are set, else the default
+let get cfg f d = cfg |> Option.bind f |> Option.defaultValue d
+
+let trimText s = Str.trim s
+
+let firstChar s = if s == "" then "" else Str.sub 0 1 s
+
+// utils/truncate.rs truncate_text and git_branch's truncation: keep `len`
+// characters, then the symbol's first (0 or less = no truncation)
+let truncateText len symbol s =
+    if len <= 0 || Str.length s <= len then s else Str.sub 0 len s + firstChar symbol
+
+// ---- git discovery ------------------------------------------------------------
+
+let readTrim p = X.readFile p |> Option.map trimText
+
+let resolveFrom base p = if Str.startsWith "/" p then Path.normalize p else Path.normalize (Path.combine base p)
+
+let commonOf gitDir =
+    match readTrim (Path.combine gitDir "commondir") with
+    | Some c -> resolveFrom gitDir c
+    | None -> gitDir
+
+let isBareDir d =
+    File.exists (Path.combine d "HEAD") && Dir.exists (Path.combine d "objects") && Dir.exists (Path.combine d "refs")
+
+let repoAt d =
+    let dotGit = Path.combine d ".git"
+    if Dir.exists dotGit then
+        Some { gitDir = dotGit; commonDir = commonOf dotGit; workdir = Some d }
+    elif File.exists dotGit then
+        match readTrim dotGit with
+        | Some (Regex @"^gitdir:\s*(.+)$" g) ->
+            let gd = resolveFrom d g
+            Some { gitDir = gd; commonDir = commonOf gd; workdir = Some d }
+        | _ -> None
+    elif isBareDir d then
+        // inside a work tree's .git (cwd = repo/.git): the repo is not bare
+        let wd = if Path.fileName d == ".git" then Some (Path.dir d) else None
+        Some { gitDir = d; commonDir = commonOf d; workdir = wd }
+    else None
+
+/// the git repository containing cwd (gix's upward discovery)
+let gitRepo : Ctx -> Option<Repo>
+
+let gitRepo ctx = X.ancestors ctx.cwd |> Seq.tryPick repoAt
+
+// git with starship's exec_git flags: -C cwd, explicit dirs, fsmonitor off,
+// no optional locks
+let git ctx repo args =
+    let wt = repo.workdir |> Option.map (fun w -> ["--work-tree"; w]) |> Option.defaultValue []
+    let head = ["-C"; ctx.cwd; "--git-dir"; repo.gitDir; "-c"; "core.fsmonitor="]
+    let argv = Seq.append wt args |> Seq.append head |> Seq.freeze
+    within env GIT_OPTIONAL_LOCKS=0
+        X.exec ctx "git" argv
+
+let headText repo = readTrim (Path.combine repo.gitDir "HEAD") |> Option.defaultValue ""
+
+let shorten r =
+    match r with
+    | Regex @"^refs/(?:heads|remotes|tags)/(.+)$" s -> s
+    | Regex @"^refs/(.+)$" s -> s
+    | _ -> r
+
+/// the current branch (None when HEAD is detached); a reftable repo's HEAD
+/// is a placeholder, so ask git there
+let branchOf ctx repo =
+    match headText repo with
+    | Regex @"^ref: refs/heads/\.invalid$" () ->
+        git ctx repo ["symbolic-ref"; "HEAD"] |> Option.map (fun o -> shorten (Str.trim o.stdout))
+    | Regex @"^ref:\s*(\S+)$" r -> Some (shorten r)
+    | _ -> None
+
+let isDetached repo = not (Str.startsWith "ref:" (headText repo))
+
+/// branch.<b>.remote and branch.<b>.merge (gix's branch_remote_name and
+/// branch_remote_ref_name for fetch)
+let upstreamOf ctx repo branch =
+    let entries =
+        git ctx repo ["config"; "--get-regexp"; @"^branch\..*\.(remote|merge)$"]
+        |> Option.map (fun o -> Str.split "\n" o.stdout |> Seq.choose (Str.trySplitOnce " ") |> Seq.freeze)
+        |> Option.defaultValue []
+    let value k = entries |> Seq.tryFind (fun (key, _) -> key == $"branch.{branch}.{k}") |> Option.map snd
+    (value "merge" |> Option.map shorten, value "remote")
+
+// ---- git_branch -----------------------------------------------------------------
+
+let gitBranchInner ctx =
+    let c = ctx.cfg.git_branch
+    let len = get c (fun x -> x.truncation_length) 0
+    let sym = get c (fun x -> x.truncation_symbol) "…"
+    match gitRepo ctx with
+    | None -> X.none
+    | Some repo ->
+        let detached = isDetached repo
+        if get c (fun x -> x.ignore_bare_repo) false && repo.workdir == None then X.none
+        elif get c (fun x -> x.only_attached) false && detached then X.none
+        else
+            let branchName = branchOf ctx repo |> Option.defaultValue "HEAD"
+            if Seq.contains branchName (get c (fun x -> x.ignore_branches) []) then X.none
+            else
+                let (remoteBranch, remoteName) =
+                    if detached then (None, None) else upstreamOf ctx repo branchName
+                let ignoredRemote = remoteName |> Option.map (fun r -> Seq.contains r (get c (fun x -> x.ignore_remotes) [])) |> Option.defaultValue false
+                let branch = truncateText len sym branchName
+                let rb = truncateText len sym (remoteBranch |> Option.defaultValue "")
+                let rn = truncateText len sym (remoteName |> Option.defaultValue "")
+                let showRemote = get c (fun x -> x.always_show_remote) false || (branch <> rb && rb <> "")
+                let vars n =
+                    match n with
+                    | "branch" -> Some (F.Plain branch)
+                    | "remote_branch" -> if showRemote && rb <> "" then Some (F.Plain rb) else None
+                    | "remote_name" -> if showRemote && not ignoredRemote && rn <> "" then Some (F.Plain rn) else None
+                    | _ -> None
+                X.render (get c (fun x -> x.format) "on [$symbol$branch(:$remote_branch)]($style) ") (get c (fun x -> x.symbol) " ") (get c (fun x -> x.style) "bold purple") vars
+
+// ---- git_commit -----------------------------------------------------------------
+
+let headId ctx repo =
+    match headText repo with
+    | Regex @"^([0-9a-f]{40,64})$" h -> Some h
+    | _ -> git ctx repo ["rev-parse"; "--verify"; "-q"; "HEAD"] |> Option.map (fun o -> Str.trim o.stdout)
+
+let gitTag ctx repo candidates =
+    let args =
+        if candidates <= 0 then ["describe"; "--tags"; "--exact-match"; "HEAD"]
+        else ["describe"; "--tags"; "--abbrev=0"; "--first-parent"; $"--candidates={candidates}"; "HEAD"]
+    git ctx repo args |> Option.map (fun o -> Str.trim o.stdout) |> Option.bind (fun t -> if t == "" then None else Some t)
+
+let gitCommitInner ctx =
+    let c = ctx.cfg.git_commit
+    match gitRepo ctx with
+    | None -> X.none
+    | Some repo ->
+        if get c (fun x -> x.only_detached) true && not (isDetached repo) then X.none
+        else
+            let hashLen = get c (fun x -> x.commit_hash_length) 7
+            let vars n =
+                match n with
+                | "hash" -> headId ctx repo |> Option.map (fun h -> F.Plain (if hashLen <= 0 then "" else Str.sub 0 (if hashLen > Str.length h then Str.length h else hashLen) h))
+                | "tag" ->
+                    if get c (fun x -> x.tag_disabled) true then None
+                    else gitTag ctx repo (get c (fun x -> x.tag_max_candidates) 0) |> Option.map (fun t -> F.Plain (get c (fun x -> x.tag_symbol) " 🏷  " + t))
+                | _ -> None
+            let style = get c (fun x -> x.style) "green bold"
+            F.render vars (fun n -> if n == "style" then Some style else None) (get c (fun x -> x.format) @"[\($hash$tag\)]($style) ")
+
+// ---- git_state ------------------------------------------------------------------
+
+type GitState =
+    | Merge
+    | Revert
+    | CherryPick
+    | Bisect
+    | ApplyMailbox
+    | ApplyMailboxRebase
+    | Rebase
+
+// gix's Repository::state, from the per-worktree git dir
+let stateOf repo =
+    let p rel = Path.combine repo.gitDir rel
+    if File.exists (p "rebase-apply/applying") then Some ApplyMailbox
+    elif File.exists (p "rebase-apply/rebasing") then Some Rebase
+    elif Dir.exists (p "rebase-apply") then Some ApplyMailboxRebase
+    elif File.exists (p "rebase-merge/interactive") then Some Rebase
+    elif Dir.exists (p "rebase-merge") then Some Rebase
+    elif File.exists (p "CHERRY_PICK_HEAD") then Some CherryPick
+    elif File.exists (p "MERGE_HEAD") then Some Merge
+    elif File.exists (p "BISECT_LOG") then Some Bisect
+    elif File.exists (p "REVERT_HEAD") then Some Revert
+    else None
+
+let readNum p =
+    readTrim p |> Option.bind (fun s -> if Str.isMatch @"^\d+$" s then Some s else None)
+
+let progressOf repo =
+    let p rel = Path.combine repo.gitDir rel
+    let pair a b =
+        match (readNum (p a), readNum (p b)) with
+        | (Some x, Some y) -> Some (x, y)
+        | _ -> None
+    if File.exists (p "rebase-merge/msgnum") then pair "rebase-merge/msgnum" "rebase-merge/end"
+    elif Dir.exists (p "rebase-apply") then pair "rebase-apply/next" "rebase-apply/last"
+    else None
+
+let gitStateInner ctx =
+    let c = ctx.cfg.git_state
+    match gitRepo ctx |> Option.bind (fun r -> stateOf r |> Option.map (fun s -> (r, s))) with
+    | None -> X.none
+    | Some (repo, state) ->
+        let (label, progress) =
+            match state with
+            | Merge -> (get c (fun x -> x.merge) "MERGING", None)
+            | Revert -> (get c (fun x -> x.revert) "REVERTING", None)
+            | CherryPick -> (get c (fun x -> x.cherry_pick) "CHERRY-PICKING", None)
+            | Bisect -> (get c (fun x -> x.bisect) "BISECTING", None)
+            | ApplyMailbox -> (get c (fun x -> x.am) "AM", progressOf repo)
+            | ApplyMailboxRebase -> (get c (fun x -> x.am_or_rebase) "AM/REBASE", progressOf repo)
+            | Rebase -> (get c (fun x -> x.rebase) "REBASING", progressOf repo)
+        let vars n =
+            match n with
+            | "state" -> Some (F.Meta label)
+            | "progress_current" -> progress |> Option.map (fun (a, _) -> F.Plain a)
+            | "progress_total" -> progress |> Option.map (fun (_, b) -> F.Plain b)
+            | _ -> None
+        let style = get c (fun x -> x.style) "bold yellow"
+        F.render vars (fun n -> if n == "style" then Some style else None) (get c (fun x -> x.format) @"\([$state( $progress_current/$progress_total)]($style)\) ")
+
+// ---- git_metrics ----------------------------------------------------------------
+
+// `git diff --raw --numstat`: raw lines then numstat lines, in the same
+// order. gix skips unmerged paths, and (work tree side) type changes.
+let numstatTotals skipTypechange out =
+    let lines = Str.split "\n" out |> Seq.freeze
+    let raw = lines |> Seq.choose (function | Regex @"^:\S+ \S+ \S+ \S+ (\S)\S*\t([^\t]*)" (st, path) -> Some (st, path) | _ -> None) |> Seq.freeze
+    let stats = lines |> Seq.choose (function | Regex @"^(\d+|-)\t(\d+|-)\t" (a, d) -> Some (a, d) | _ -> None) |> Seq.freeze
+    let unmerged = raw |> Seq.where (fun (st, _) -> st == "U") |> Seq.map snd |> Seq.freeze
+    let n v = Str.tryToInt v |> Option.defaultValue 0
+    Seq.zip raw stats
+    |> Seq.where (fun ((st, path), _) -> not (Seq.contains path unmerged) && not (skipTypechange && st == "T"))
+    |> Seq.fold (fun (sa, sd) (_, (a, d)) -> (sa + n a, sd + n d)) (0, 0)
+
+let gitMetricsInner ctx =
+    let c = ctx.cfg.git_metrics
+    if get c (fun x -> x.disabled) true then X.none
+    else
+        match gitRepo ctx with
+        | Some repo when repo.workdir <> None ->
+            let sub = if get c (fun x -> x.ignore_submodules) false then ["--ignore-submodules"] else []
+            let staged = git ctx repo (Seq.append ["diff"; "--cached"; "--raw"; "--numstat"] sub |> Seq.freeze)
+            let unstaged = git ctx repo (Seq.append ["diff"; "--raw"; "--numstat"] sub |> Seq.freeze)
+            match (staged, unstaged) with
+            | (Some s, Some u) ->
+                let (a1, d1) = numstatTotals false s.stdout
+                let (a2, d2) = numstatTotals true u.stdout
+                let nonzero = get c (fun x -> x.only_nonzero_diffs) true
+                let value n = if nonzero && n == 0 then None else Some (F.Plain $"{n}")
+                let vars n =
+                    match n with
+                    | "added" -> value (a1 + a2)
+                    | "deleted" -> value (d1 + d2)
+                    | _ -> None
+                let added = get c (fun x -> x.added_style) "bold green"
+                let deleted = get c (fun x -> x.deleted_style) "bold red"
+                let styleVars n =
+                    match n with
+                    | "added_style" -> Some added
+                    | "deleted_style" -> Some deleted
+                    | _ -> None
+                F.render vars styleVars (get c (fun x -> x.format) "([+$added]($added_style) )([-$deleted]($deleted_style) )")
+            | _ -> X.none
+        | _ -> X.none
+
+// ---- git_status -----------------------------------------------------------------
+
+let zeroCounts = {
+    conflicted = 0
+    deleted = 0
+    renamed = 0
+    modified = 0
+    staged = 0
+    typechanged = 0
+    untracked = 0
+    worktreeAdded = 0
+    worktreeDeleted = 0
+    worktreeModified = 0
+    worktreeTypechanged = 0
+    indexAdded = 0
+    indexDeleted = 0
+    indexModified = 0
+    indexTypechanged = 0
+    ahead = None
+    behind = None
+}
+
+// one XY pair: X is the index side (HEAD vs index), Y the work tree side
+let countXY k x y sameMode =
+    let k1 =
+        match x with
+        | "A" -> { k with staged = k.staged + 1; indexAdded = k.indexAdded + 1 }
+        | "D" -> { k with deleted = k.deleted + 1; indexDeleted = k.indexDeleted + 1 }
+        | "M" when sameMode -> { k with staged = k.staged + 1; indexModified = k.indexModified + 1 }
+        | "M" | "T" -> { k with staged = k.staged + 1; indexTypechanged = k.indexTypechanged + 1 }
+        | _ -> k
+    match y with
+    | "D" -> { k1 with deleted = k1.deleted + 1; worktreeDeleted = k1.worktreeDeleted + 1 }
+    | "A" -> { k1 with modified = k1.modified + 1; worktreeAdded = k1.worktreeAdded + 1 }
+    | "M" -> { k1 with modified = k1.modified + 1; worktreeModified = k1.worktreeModified + 1 }
+    | "T" -> { k1 with typechanged = k1.typechanged + 1; worktreeTypechanged = k1.worktreeTypechanged + 1 }
+    | _ -> k1
+
+let countLine k line =
+    match line with
+    | Regex @"^# branch\.ab \+(\d+) -(\d+)" (a, b) -> { k with ahead = Str.tryToInt a; behind = Str.tryToInt b }
+    | Regex @"^1 (.)(.) \S+ (\d+) (\d+) " (x, y, mh, mi) -> countXY k x y (mh == mi)
+    | Regex @"^2 (.)(.) \S+ \d+ \d+ " (_, y) -> countXY { k with renamed = k.renamed + 1 } "." y true
+    | Regex @"^u " () -> { k with conflicted = k.conflicted + 1 }
+    | Regex @"^\? " () -> { k with untracked = k.untracked + 1 }
+    | _ -> k
+
+let stashCount repo =
+    X.readFile (Path.combine repo.commonDir "logs/refs/stash")
+    |> Option.map (fun s -> Str.split "\n" s |> Seq.where (fun l -> Str.trim l <> "") |> Seq.length)
+    |> Option.defaultValue 0
+
+// utils/format.rs count: the symbol format with $count, absent at zero
+let countFmt fmt n =
+    if n == 0 then None
+    else Some (F.ofSegs (F.render (fun v -> if v == "count" then Some (F.Plain $"{n}") else None) (fun _ -> None) fmt))
+
+let symbolFmt fmt = Some (F.ofSegs (F.render (fun _ -> None) (fun _ -> None) fmt))
+
+let gitStatusInner ctx =
+    let c = ctx.cfg.git_status
+    match gitRepo ctx with
+    | Some repo when repo.workdir <> None ->
+        let g f d = get c f d
+        let untrackedSym = g (fun x -> x.untracked) "?"
+        let aheadSym = g (fun x -> x.ahead) "⇡"
+        let behindSym = g (fun x -> x.behind) "⇣"
+        let upToDate = g (fun x -> x.up_to_date) ""
+        let diverged = g (fun x -> x.diverged) "⇕"
+        let wantBranch = aheadSym <> "" || behindSym <> "" || upToDate <> "" || diverged <> ""
+        let ignoreSub = g (fun x -> x.ignore_submodules) false
+        let args =
+            Seq.concat [
+                ["status"; "--porcelain=2"]
+                (if wantBranch then ["--branch"] else [])
+                (if untrackedSym == "" then ["--untracked-files=no"] else ["--untracked-files=all"])
+                (if ignoreSub then ["--ignore-submodules=dirty"] elif untrackedSym == "" then ["--ignore-submodules=untracked"] else [])
+            ]
+            |> Seq.freeze
+        match git ctx repo args with
+        | None -> X.none
+        | Some out ->
+            let k = Str.split "\n" out.stdout |> Seq.fold countLine zeroCounts
+            let aheadBehind =
+                match (k.ahead, k.behind) with
+                | (Some a, Some b) ->
+                    if a > 0 && b > 0 then
+                        Some (F.ofSegs (F.render (fun v -> match v with | "ahead_count" -> Some (F.Plain $"{a}") | "behind_count" -> Some (F.Plain $"{b}") | _ -> None) (fun _ -> None) diverged))
+                    elif a > 0 then countFmt aheadSym a
+                    elif b > 0 then countFmt behindSym b
+                    else symbolFmt upToDate
+                | _ -> None
+            let vars n =
+                match n with
+                | "all_status" -> Some (F.Meta "$conflicted$stashed$deleted$renamed$modified$typechanged$staged$untracked")
+                | "stashed" -> countFmt (g (fun x -> x.stashed) @"\$") (stashCount repo)
+                | "ahead_behind" -> aheadBehind
+                | "conflicted" -> countFmt (g (fun x -> x.conflicted) "=") k.conflicted
+                | "deleted" -> countFmt (g (fun x -> x.deleted) "✘") k.deleted
+                | "renamed" -> countFmt (g (fun x -> x.renamed) "»") k.renamed
+                | "modified" -> countFmt (g (fun x -> x.modified) "!") k.modified
+                | "staged" -> countFmt (g (fun x -> x.staged) "+") k.staged
+                | "untracked" -> countFmt untrackedSym k.untracked
+                | "typechanged" -> countFmt (g (fun x -> x.typechanged) "") k.typechanged
+                | "worktree_added" -> countFmt (g (fun x -> x.worktree_added) "") k.worktreeAdded
+                | "worktree_deleted" -> countFmt (g (fun x -> x.worktree_deleted) "") k.worktreeDeleted
+                | "worktree_modified" -> countFmt (g (fun x -> x.worktree_modified) "") k.worktreeModified
+                | "worktree_typechanged" -> countFmt (g (fun x -> x.worktree_typechanged) "") k.worktreeTypechanged
+                | "index_added" -> countFmt (g (fun x -> x.index_added) "") k.indexAdded
+                | "index_deleted" -> countFmt (g (fun x -> x.index_deleted) "") k.indexDeleted
+                | "index_modified" -> countFmt (g (fun x -> x.index_modified) "") k.indexModified
+                | "index_typechanged" -> countFmt (g (fun x -> x.index_typechanged) "") k.indexTypechanged
+                | _ -> None
+            let style = g (fun x -> x.style) "red bold"
+            F.render vars (fun n -> if n == "style" then Some style else None) (g (fun x -> x.format) @"([\[$all_status$ahead_behind\]]($style) )")
+    | _ -> X.none
+
+// ---- hg -------------------------------------------------------------------------
+
+// ScanAncestors: the nearest ancestor holding the folder `name`
+let rootWithDir ctx name = X.ancestors ctx.cwd |> Seq.tryFind (fun d -> Dir.exists (Path.combine d name))
+
+let rootWithFile ctx name = X.ancestors ctx.cwd |> Seq.tryFind (fun d -> File.exists (Path.combine d name))
+
+let hgBranchInner ctx =
+    let c = ctx.cfg.hg_branch
+    if get c (fun x -> x.disabled) true then X.none
+    else
+        match rootWithDir ctx ".hg" with
+        | None -> X.none
+        | Some root ->
+            let hg rel = Path.combine (Path.combine root ".hg") rel
+            let len = get c (fun x -> x.truncation_length) 0
+            let sym = get c (fun x -> x.truncation_symbol) "…"
+            let name =
+                X.readFile (hg "bookmarks.current")
+                |> Option.orElse (readTrim (hg "branch"))
+                |> Option.defaultValue "default"
+            let topic = readTrim (hg "topic") |> Option.map (truncateText len sym) |> Option.defaultValue ""
+            let vars n =
+                match n with
+                | "branch" -> Some (F.Plain (truncateText len sym name))
+                | "topic" -> Some (F.Plain topic)
+                | _ -> None
+            X.render (get c (fun x -> x.format) "on [$symbol$branch(:$topic)]($style) ") (get c (fun x -> x.symbol) " ") (get c (fun x -> x.style) "bold purple") vars
+
+// dirstate starts with the two parents (20 bytes each); a non-null p2 is a merge
+let hgMerging dirstate =
+    if not (File.exists dirstate) then false
+    else
+        let b = File.readBytes dirstate
+        if Size.toBytes (Bytes.length b) < 40 then false
+        else Str.isMatch "[1-9a-f]" (Bytes.toHex (Bytes.sub 20 20 b))
+
+let hgStateInner ctx =
+    let c = ctx.cfg.hg_state
+    if get c (fun x -> x.disabled) true then X.none
+    else
+        match rootWithDir ctx ".hg" with
+        | None -> X.none
+        | Some root ->
+            let hg rel = Path.combine (Path.combine root ".hg") rel
+            let has rel = File.exists (hg rel) || Dir.exists (hg rel)
+            let label =
+                if has "rebasestate" then Some (get c (fun x -> x.rebase) "REBASING")
+                elif has "updatestate" then Some (get c (fun x -> x.update) "UPDATING")
+                elif has "bisect.state" then Some (get c (fun x -> x.bisect) "BISECTING")
+                elif has "graftstate" then Some (get c (fun x -> x.graft) "GRAFTING")
+                elif has "transplant/journal" then Some (get c (fun x -> x.transplant) "TRANSPLANTING")
+                elif has "histedit-state" then Some (get c (fun x -> x.histedit) "HISTEDITING")
+                elif hgMerging (hg "dirstate") then Some (get c (fun x -> x.merge) "MERGING")
+                else None
+            match label with
+            | None -> X.none
+            | Some l ->
+                let style = get c (fun x -> x.style) "bold yellow"
+                F.render (fun n -> if n == "state" then Some (F.Meta l) else None) (fun n -> if n == "style" then Some style else None) (get c (fun x -> x.format) @"\([$state]($style)\) ")
+
+// ---- fossil -----------------------------------------------------------------------
+
+let fossilBranchInner ctx =
+    let c = ctx.cfg.fossil_branch
+    if get c (fun x -> x.disabled) true then X.none
+    elif rootWithFile ctx ".fslckout" == None then X.none
+    else
+        match X.exec ctx "fossil" ["branch"; "current"] with
+        | None -> X.none
+        | Some o ->
+            let branch = truncateText (get c (fun x -> x.truncation_length) 0) (get c (fun x -> x.truncation_symbol) "…") (Str.trim o.stdout)
+            X.render (get c (fun x -> x.format) "on [$symbol$branch]($style) ") (get c (fun x -> x.symbol) " ") (get c (fun x -> x.style) "bold purple") (fun n -> if n == "branch" then Some (F.Plain branch) else None)
+
+let fossilMetricsInner ctx =
+    let c = ctx.cfg.fossil_metrics
+    if get c (fun x -> x.disabled) true then X.none
+    elif rootWithFile ctx ".fslckout" == None then X.none
+    else
+        match X.exec ctx "fossil" ["diff"; "-i"; "--numstat"] with
+        | None -> X.none
+        | Some o ->
+            let nonzero = get c (fun x -> x.only_nonzero_diffs) true
+            let (added, deleted) =
+                match Str.split "\n" o.stdout |> Seq.tryLast with
+                | Some (Regex @"^\s*(\d+)\s+(\d+) TOTAL over \d+ changed files?$" (a, d)) ->
+                    let z v = if v == "0" && nonzero then "" else v
+                    (z a, z d)
+                | _ -> ("", "")
+            let vars n =
+                match n with
+                | "added" -> Some (F.Plain added)
+                | "deleted" -> Some (F.Plain deleted)
+                | _ -> None
+            let addedStyle = get c (fun x -> x.added_style) "bold green"
+            let deletedStyle = get c (fun x -> x.deleted_style) "bold red"
+            let styleVars n =
+                match n with
+                | "added_style" -> Some addedStyle
+                | "deleted_style" -> Some deletedStyle
+                | _ -> None
+            F.render vars styleVars (get c (fun x -> x.format) "([+$added]($added_style) )([-$deleted]($deleted_style) )")
+
+// ---- pijul ------------------------------------------------------------------------
+
+let pijulInner ctx =
+    let c = ctx.cfg.pijul_channel
+    if get c (fun x -> x.disabled) true then X.none
+    elif rootWithDir ctx ".pijul" == None then X.none
+    else
+        let channel =
+            X.exec ctx "pijul" ["channel"]
+            |> Option.bind (fun o -> Str.split "\n" o.stdout |> Seq.tryPick (fun l -> if Str.startsWith "* " l then Some l[2..] else None))
+        match channel with
+        | None -> X.none
+        | Some ch ->
+            let t = truncateText (get c (fun x -> x.truncation_length) 0) (get c (fun x -> x.truncation_symbol) "…") ch
+            X.render (get c (fun x -> x.format) "on [$symbol$channel]($style) ") (get c (fun x -> x.symbol) " ") (get c (fun x -> x.style) "bold purple") (fun n -> if n == "channel" then Some (F.Plain t) else None)
+
+// ---- jj ---------------------------------------------------------------------------
+
+let jjTemplate = <<<
+    if(
+        current_working_copy,
+        join(
+            "\n",
+            concat("current.has_description = ", description.len() > 0),
+            concat("current.hidden = ", hidden),
+            concat("current.immutable = ", immutable),
+            concat("current.divergent = ", divergent),
+            concat("current.change_offset = ", change_offset),
+            concat("current.change_id = \"", change_id, "\""),
+            concat("current.change_id_prefix_len = ", change_id.shortest().prefix().len()),
+            concat("current.commit_id = \"", commit_id, "\""),
+            concat("current.commit_id_prefix_len = ", commit_id.shortest().prefix().len()),
+            concat("current.lines_added = ", diff.stat().total_added()),
+            concat("current.lines_removed = ", diff.stat().total_removed()),
+            concat("current.conflicted = ", conflict),
+            concat("current.bookmarks = [", bookmarks.map(|bm| concat("\"", bm, "\"")).join(","), "]"),
+            concat(
+                "current.statuses = \"",
+                self
+                    .diff()
+                    .files()
+                    .map(|file| file.status_char())
+                    .join(""),
+                "\"",
+            ),
+            "",
+        ),
+        concat(
+            if(
+                conflict,
+                "parents.conflicted = true\n",
+            ),
+            if(
+                bookmarks.len() > 0,
+                concat("parents.bookmarks = [", bookmarks.map(|bm| concat("\"", bm, "\"")).join(","), "]\n"),
+            ),
+        ),
+    )
+
+let toChange r =
+    let cur = r.current
+    let parentsConflicted = r.parents |> Option.bind (fun p -> p.conflicted) |> Option.defaultValue false
+    let parentBookmarks = r.parents |> Option.bind (fun p -> p.bookmarks) |> Option.defaultValue []
+    let change = {
+        change = cur.change_id
+        changeShortest = cur.change_id_prefix_len
+        commit = cur.commit_id
+        commitShortest = cur.commit_id_prefix_len
+        changeOffset = if cur.divergent then Some cur.change_offset else None
+        bookmarks = Seq.append (cur.bookmarks |> Option.defaultValue []) parentBookmarks |> Seq.freeze
+        linesAdded = cur.lines_added
+        linesRemoved = cur.lines_removed
+        conflictedFlag = (cur.conflicted |> Option.defaultValue false) || parentsConflicted
+        descriptionFlag = cur.has_description
+        hiddenFlag = cur.hidden
+        immutableFlag = cur.immutable
+        statuses = cur.statuses
+    }
+    if Str.length cur.change_id <> 32 then None else Some change
+
+/// JJRepo::current_change: one `jj show` of @, its latest conflicted
+/// mutable ancestor and its latest bookmarked ancestor, as TOML
+let jjChange ctx =
+    match rootWithDir ctx ".jj" with
+    | None -> None
+    | Some root ->
+        let args = [
+            "--color"
+            "never"
+            "--no-integrate-operation"
+            "--no-pager"
+            "--quiet"
+            "--repository"
+            root
+            "show"
+            "@ | latest(heads(mutable() & ::@ & conflicts()), 1) | latest(bookmarks() & ::@, 1)"
+            "--no-patch"
+            "--template"
+            jjTemplate |> Str.join "\n"
+        ]
+        X.exec ctx "jj" args
+        |> Option.bind (fun o -> [o.stdout] |> from toml JjRaw |> try)
+        |> Option.bind toChange
+
+let bmNoStar b = if Str.endsWith "*" b then b[0..^2] else b
+
+let bmName b =
+    match Str.trySplitOnce "@" (bmNoStar b) with
+    | Some (n, _) -> n
+    | None -> bmNoStar b
+
+let bmRemote b = Str.trySplitOnce "@" (bmNoStar b) |> Option.map snd
+
+let jjBookmarkInner ctx =
+    let c = ctx.cfg.jj_bookmark
+    if get c (fun x -> x.disabled) false then X.none
+    else
+        match jjChange ctx with
+        | None -> X.none
+        | Some ch ->
+            let ignoreNames = get c (fun x -> x.ignore_names) []
+            let ignoreRemotes = get c (fun x -> x.ignore_remotes) []
+            let kept =
+                ch.bookmarks
+                |> Seq.where (fun b ->
+                    let ignored = Seq.contains (bmName b) ignoreNames || (bmRemote b |> Option.map (fun r -> Seq.contains r ignoreRemotes) |> Option.defaultValue false)
+                    not ignored)
+                |> Seq.freeze
+            match kept with
+            | [] -> X.none
+            | first :: rest ->
+                let overflow = Seq.length rest
+                let item s = truncateText (get c (fun x -> x.truncation_length) 65535) (get c (fun x -> x.truncation_symbol) "…") s
+                let diverged = Str.endsWith "*" first
+                let vars n =
+                    match n with
+                    | "diverged" -> if diverged then Some (F.Meta (get c (fun x -> x.diverged_symbol) "*")) else None
+                    | "bookmark" -> Some (F.Plain (item (bmName first)))
+                    | "remote" -> bmRemote first |> Option.map (fun r -> F.Plain (item r))
+                    | "overflow_count" -> if overflow > 0 then Some (F.Plain $"{overflow}") else None
+                    | _ -> None
+                X.render (get c (fun x -> x.format) @"on [$symbol$bookmark(@$remote)$diverged( \(+$overflow_count others\))]($style) ") (get c (fun x -> x.symbol) " ") (get c (fun x -> x.style) "bold purple") vars
+
+let idPrefix id n =
+    let e = if n < Str.length id then n else Str.length id
+    if e <= 0 then None else Some (Str.sub 0 e id)
+
+let idSuffix id n len =
+    let start = if n < Str.length id then n else Str.length id
+    let upto = if n > len then n else len
+    let stop = if upto < Str.length id then upto else Str.length id
+    if stop <= start then None else Some (Str.sub start (stop - start) id)
+
+let jjChangeInner ctx =
+    let c = ctx.cfg.jj_change
+    if get c (fun x -> x.disabled) false then X.none
+    else
+        match jjChange ctx with
+        | None -> X.none
+        | Some ch ->
+            let changeLen = get c (fun x -> x.change_hash_length) 7
+            let commitLen = get c (fun x -> x.commit_hash_length) 7
+            let plainOpt o = o |> Option.map F.Plain
+            let vars n =
+                match n with
+                | "change" -> Some (F.Meta "[$change_prefix]($prefix_style)[$change_suffix]($suffix_style)([/$change_offset]($change_offset_style))")
+                | "commit" -> Some (F.Meta "[$commit_prefix]($prefix_style)[$commit_suffix]($suffix_style)")
+                | "change_offset" -> ch.changeOffset |> Option.map (fun o -> F.Plain $"{o}")
+                | "change_prefix" -> plainOpt (idPrefix ch.change ch.changeShortest)
+                | "change_suffix" -> plainOpt (idSuffix ch.change ch.changeShortest changeLen)
+                | "commit_prefix" -> plainOpt (idPrefix ch.commit ch.commitShortest)
+                | "commit_suffix" -> plainOpt (idSuffix ch.commit ch.commitShortest commitLen)
+                | _ -> None
+            let prefixStyle = get c (fun x -> x.prefix_style) "green bold"
+            let suffixStyle = get c (fun x -> x.suffix_style) "dimmed"
+            let offsetStyle = get c (fun x -> x.change_offset_style) "bold"
+            let styleVars n =
+                match n with
+                | "prefix_style" -> Some prefixStyle
+                | "suffix_style" -> Some suffixStyle
+                | "change_offset_style" -> Some offsetStyle
+                | _ -> None
+            F.render vars styleVars (get c (fun x -> x.format) "$change ")
+
+let jjMetricsInner ctx =
+    let c = ctx.cfg.jj_metrics
+    if get c (fun x -> x.disabled) false then X.none
+    else
+        match jjChange ctx with
+        | None -> X.none
+        | Some ch ->
+            let nonzero = get c (fun x -> x.only_nonzero_diffs) true
+            let value v = if nonzero && v == 0 then None else Some (F.Plain $"{v}")
+            let vars n =
+                match n with
+                | "added" -> value ch.linesAdded
+                | "deleted" -> value ch.linesRemoved
+                | _ -> None
+            let addedStyle = get c (fun x -> x.added_style) "bold green"
+            let deletedStyle = get c (fun x -> x.deleted_style) "bold red"
+            let styleVars n =
+                match n with
+                | "added_style" -> Some addedStyle
+                | "deleted_style" -> Some deletedStyle
+                | _ -> None
+            F.render vars styleVars (get c (fun x -> x.format) "([+$added]($added_style) )([-$deleted]($deleted_style) )")
+
+let charCount ch s = Str.rmatchAll "(.)" s |> Seq.where (fun g -> g[0] == ch) |> Seq.length
+
+let jjStatusInner ctx =
+    let c = ctx.cfg.jj_status
+    if get c (fun x -> x.disabled) false then X.none
+    else
+        match jjChange ctx with
+        | None -> X.none
+        | Some ch ->
+            let flag on fmt = if on then symbolFmt fmt else None
+            let vars n =
+                match n with
+                | "all" -> Some (F.Meta "$conflicted$description$hidden$immutable$added$copied$deleted$modified$renamed")
+                | "added" -> countFmt (get c (fun x -> x.added) "+") (charCount "A" ch.statuses)
+                | "copied" -> countFmt (get c (fun x -> x.copied) "=") (charCount "C" ch.statuses)
+                | "deleted" -> countFmt (get c (fun x -> x.deleted) "✘") (charCount "D" ch.statuses)
+                | "modified" -> countFmt (get c (fun x -> x.modified) "~") (charCount "M" ch.statuses)
+                | "renamed" -> countFmt (get c (fun x -> x.renamed) "»") (charCount "R" ch.statuses)
+                | "conflicted" -> flag ch.conflictedFlag (get c (fun x -> x.conflicted) "!")
+                | "description" ->
+                    if ch.descriptionFlag then symbolFmt (get c (fun x -> x.description_present) "")
+                    else symbolFmt (get c (fun x -> x.description_empty) "◌")
+                | "hidden" -> flag ch.hiddenFlag (get c (fun x -> x.hidden) "")
+                | "immutable" -> flag ch.immutableFlag (get c (fun x -> x.immutable) "◆")
+                | _ -> None
+            let style = get c (fun x -> x.style) "bold red"
+            F.render vars (fun n -> if n == "style" then Some style else None) (get c (fun x -> x.format) @"([\[$all\]]($style) )")
+
+// ---- vcsh -------------------------------------------------------------------------
+
+let vcshInner ctx =
+    let c = ctx.cfg.vcsh
+    let repo = Env.get "VCSH_REPO_NAME" |> Option.defaultValue ""
+    if Str.trim repo == "" then X.none
+    else
+        X.render (get c (fun x -> x.format) "vcsh [$symbol$repo]($style) ") (get c (fun x -> x.symbol) "") (get c (fun x -> x.style) "bold yellow") (fun n -> if n == "repo" then Some (F.Plain repo) else None)
+
+// ---- vcs ----------------------------------------------------------------------------
+
+// the module functions as starship's modules::handle sees them (each one's
+// own disabled check only; the central one in print.rs does not apply)
+let inner = [
+    ("git_branch", gitBranchInner)
+    ("git_commit", gitCommitInner)
+    ("git_state", gitStateInner)
+    ("git_metrics", gitMetricsInner)
+    ("git_status", gitStatusInner)
+    ("hg_branch", hgBranchInner)
+    ("hg_state", hgStateInner)
+    ("fossil_branch", fossilBranchInner)
+    ("fossil_metrics", fossilMetricsInner)
+    ("pijul_channel", pijulInner)
+    ("jj_bookmark", jjBookmarkInner)
+    ("jj_change", jjChangeInner)
+    ("jj_metrics", jjMetricsInner)
+    ("jj_status", jjStatusInner)
+    ("vcsh", vcshInner)
+]
+
+let vcsFound ctx name =
+    match name with
+    | "git" -> gitRepo ctx <> None
+    | "jj" | "jujutsu" -> rootWithDir ctx ".jj" <> None
+    | "hg" | "mercurial" -> rootWithDir ctx ".hg" <> None
+    | "pijul" -> rootWithDir ctx ".pijul" <> None
+    | "fossil" -> rootWithFile ctx ".fslckout" <> None
+    | _ -> false
+
+let vcsInner ctx =
+    let c = ctx.cfg.vcs
+    let order = get c (fun x -> x.order) ["git"; "jj"; "hg"; "pijul"; "fossil"]
+    if get c (fun x -> x.disabled) false then X.none
+    else
+        match order |> Seq.tryFind (vcsFound ctx) with
+        | None -> X.none
+        | Some v ->
+            let fmt =
+                match v with
+                | "git" -> get c (fun x -> x.git_modules) "$git_branch$git_commit$git_state$git_metrics$git_status"
+                | "jj" | "jujutsu" -> get c (fun x -> x.jj_modules) "$jj_bookmark$jj_change$jj_metrics$jj_status"
+                | "hg" | "mercurial" -> get c (fun x -> x.hg_modules) "$hg_branch$hg_state"
+                | "pijul" -> get c (fun x -> x.pijul_modules) "$pijul_channel"
+                | _ -> get c (fun x -> x.fossil_modules) "$fossil_branch$fossil_metrics"
+            // `$vcs` inside itself is an error in starship: the module renders nothing
+            if fmt == "" || Seq.contains "vcs" (F.variables fmt) then X.none
+            else
+                let names = F.variables fmt
+                let results =
+                    names
+                    |> Seq.pmap (fun n -> (n, inner |> Seq.tryFind (fun (k, _) -> k == n) |> Option.map (fun (_, run) -> run ctx |> Seq.freeze)))
+                    |> Seq.freeze
+                let vars n = results |> Seq.tryPick (fun (k, r) -> if k == n then r else None) |> Option.map F.ofSegs
+                F.render vars (fun _ -> None) fmt
+
+// ---- exports ------------------------------------------------------------------------
+
+// print.rs skips a module whose config says `disabled = true`
+let central disabled run ctx = if disabled ctx then X.none else run ctx
+
+/// git_branch: the current branch and its upstream
+let gitBranch : Ctx -> seq<Seg>
+
+let gitBranch ctx = central (fun x -> (x.cfg.git_branch |> Option.bind (fun c -> c.disabled)) == Some true) gitBranchInner ctx
+
+/// git_commit: the HEAD hash (detached by default) and its tag
+let gitCommit : Ctx -> seq<Seg>
+
+let gitCommit ctx = central (fun x -> (x.cfg.git_commit |> Option.bind (fun c -> c.disabled)) == Some true) gitCommitInner ctx
+
+/// git_state: an operation in progress (rebase, merge, bisect ...)
+let gitState : Ctx -> seq<Seg>
+
+let gitState ctx = central (fun x -> (x.cfg.git_state |> Option.bind (fun c -> c.disabled)) == Some true) gitStateInner ctx
+
+/// git_metrics: added/deleted line counts (disabled by default)
+let gitMetrics : Ctx -> seq<Seg>
+
+let gitMetrics ctx = gitMetricsInner ctx
+
+/// git_status: change counters and ahead/behind
+let gitStatus : Ctx -> seq<Seg>
+
+let gitStatus ctx = central (fun x -> (x.cfg.git_status |> Option.bind (fun c -> c.disabled)) == Some true) gitStatusInner ctx
+
+/// hg_branch (disabled by default)
+let hgBranch : Ctx -> seq<Seg>
+
+let hgBranch ctx = hgBranchInner ctx
+
+/// hg_state (disabled by default)
+let hgState : Ctx -> seq<Seg>
+
+let hgState ctx = hgStateInner ctx
+
+/// fossil_branch (disabled by default)
+let fossilBranch : Ctx -> seq<Seg>
+
+let fossilBranch ctx = fossilBranchInner ctx
+
+/// fossil_metrics (disabled by default)
+let fossilMetrics : Ctx -> seq<Seg>
+
+let fossilMetrics ctx = fossilMetricsInner ctx
+
+/// pijul_channel (disabled by default)
+let pijulChannel : Ctx -> seq<Seg>
+
+let pijulChannel ctx = pijulInner ctx
+
+/// jj_bookmark
+let jjBookmark : Ctx -> seq<Seg>
+
+let jjBookmark ctx = jjBookmarkInner ctx
+
+/// jj_change
+let jjChangeModule : Ctx -> seq<Seg>
+
+let jjChangeModule ctx = jjChangeInner ctx
+
+/// jj_metrics
+let jjMetrics : Ctx -> seq<Seg>
+
+let jjMetrics ctx = jjMetricsInner ctx
+
+/// jj_status
+let jjStatus : Ctx -> seq<Seg>
+
+let jjStatus ctx = jjStatusInner ctx
+
+/// vcs: the modules of whichever VCS the cwd belongs to
+let vcs : Ctx -> seq<Seg>
+
+let vcs ctx = vcsInner ctx
+
+/// vcsh: the active vcsh repo
+let vcsh : Ctx -> seq<Seg>
+
+let vcsh ctx = central (fun x -> (x.cfg.vcsh |> Option.bind (fun c -> c.disabled)) == Some true) vcshInner ctx
+
+/// this file's modules, by starship name
+let modules : seq<string * (Ctx -> seq<Seg>)>
+
+let modules = [
+    ("git_branch", gitBranch)
+    ("git_commit", gitCommit)
+    ("git_state", gitState)
+    ("git_metrics", gitMetrics)
+    ("git_status", gitStatus)
+    ("hg_branch", hgBranch)
+    ("hg_state", hgState)
+    ("fossil_branch", fossilBranch)
+    ("fossil_metrics", fossilMetrics)
+    ("pijul_channel", pijulChannel)
+    ("jj_bookmark", jjBookmark)
+    ("jj_change", jjChangeModule)
+    ("jj_metrics", jjMetrics)
+    ("jj_status", jjStatus)
+    ("vcs", vcs)
+    ("vcsh", vcsh)
+]

@@ -1,0 +1,55 @@
+#!/usr/bin/env weir
+// format-language oracle: render root formats made of text, groups,
+// conditionals, escapes, styles and palettes with the real starship and with
+// the port, byte for byte. Needs a starship binary: --starship <path>.
+
+type Cli = {
+    /// the reference starship binary
+    starship: string
+}
+
+let cli = Args.load Cli
+let root = Self.scriptPath |> Path.dir |> Path.dir
+let bin = Path.combine root "bin/starship.weir"
+
+let cases = [
+    "plain text"
+    "[red](red) [bold green](bold green) [dim](dimmed italic)"
+    "[a[b](blue)c](bg:#ff0080 underline)"
+    "[x](fg:#1f2E3d bg:23) [y](bright-black) [z](bg:bright-cyan black)"
+    "[a](red)[b](prev_fg)[c](bg:blue)[d](fg:prev_bg)"
+    "(no vars here)[shown]()"
+    "\\[escaped\\] \\(parens\\) \\$dollar"
+    "[a](fg:none) [b](nonsense) [c](bg:nonsense red)"
+    "[pal](mine) [pal2](bg:other)"
+    "[strike](strikethrough blink inverted hidden)"
+    "($zig)after"
+    "[](red)x[$nothing](blue)y[](bold)"
+]
+
+within tmp d
+    let config = Path.combine d "s.toml"
+    let results =
+        cases
+        |> Seq.map (fun fmt ->
+            let lit = fmt |> Str.replace "\\" "\\\\" |> Str.replace "\"" "\\\""
+            [
+                "add_newline = false"
+                $"format = \"{lit}\""
+                "palette = \"p\""
+                "[palettes.p]"
+                "mine = \"#00ff00\""
+                "other = \"208\""
+            ] |> File.write config
+            let w =
+                within cd d
+                    within env STARSHIP_CONFIG=$config STARSHIP_SHELL=
+                        ^$cli.starship prompt | text
+            let g = weir $bin prompt --path $d --config $config | text
+            (fmt, w, g))
+        |> Seq.freeze
+    let bad = results |> Seq.where (fun (_, w, g) -> w <> g) |> Seq.freeze
+    for (fmt, w, g) in bad do
+        printerr $"MISMATCH {fmt}\n  want {show w}\n  got  {show g}"
+    print $"format oracle: {Seq.length results - Seq.length bad}/{Seq.length results} match"
+    if not (Seq.isEmpty bad) then exit 1

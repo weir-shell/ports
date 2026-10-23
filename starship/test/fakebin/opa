@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Version: 0.62.1"; echo "Build Commit: x"

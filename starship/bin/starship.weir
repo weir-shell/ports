@@ -1,0 +1,49 @@
+#!/usr/bin/env weir
+// `starship prompt` / `starship module <name>` as a script: render once and
+// print. The REPL uses starship.weir's `prompt` directly; this is for
+// testing, comparing with real starship, and other shells.
+
+import "../starship.weir" as Ship
+import "../lib/ctx.weir" as X
+import "../lib/fmt.weir" as F
+
+type Opts = {
+    /// directory to render for (default: the current one)
+    path: Option<string>
+    /// the previous command's exit code
+    status: Option<int>
+    /// config file (default: $STARSHIP_CONFIG, else ~/.config/starship.toml)
+    config: Option<string>
+    /// render without colour
+    plain: bool
+}
+
+type ModuleOpts = {
+    /// the module to render (e.g. git_branch, custom.foo)
+    name: string
+    path: Option<string>
+    status: Option<int>
+    config: Option<string>
+    plain: bool
+}
+
+type Cli =
+    | Prompt of Opts
+    | Module of ModuleOpts
+
+let ctxOf status config plain =
+    let cfg = X.loadConfig (config |> Option.defaultWith X.configPath)
+    let dir = pwd
+    let code = status |> Option.defaultValue 0
+    let c = X.make cfg dir (code == 0) (if code == 0 then None else Some code)
+    { c with color = c.color && not plain }
+
+match Args.load Cli with
+| Prompt o ->
+    within cd (o.path |> Option.defaultValue pwd)
+        let c = ctxOf o.status o.config o.plain
+        Ship.lines c |> Seq.iter print
+| Module o ->
+    within cd (o.path |> Option.defaultValue pwd)
+        let c = ctxOf o.status o.config o.plain
+        Ship.runModule c [o.name] o.name |> F.paint c.color c.palette c.width |> Seq.iter print

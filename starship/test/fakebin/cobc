@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "cobc (GnuCOBOL) 3.2.0\n"

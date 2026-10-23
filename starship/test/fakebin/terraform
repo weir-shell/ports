@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Terraform v1.7.5"; echo "on linux_amd64"

@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "cmake version 3.27.4\n\nCMake suite\n"

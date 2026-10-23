@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Welcome to Rakudo™ v2024.01."; echo "Implementing the Raku® Programming Language v6.d."; echo "Built on MoarVM version 2024.01."

@@ -1,0 +1,1039 @@
+module Sys
+
+// the system / shell-state modules (src/modules/<name>.rs): who and where
+// (username, hostname, localip, directory, os), the machine (memory_usage,
+// battery, time), the shell (shlvl, shell, status, character, jobs,
+// cmd_duration, sudo), layout (line_break, fill), the user-defined tables
+// (custom, env_var) and the Claude Code statusline modules.
+
+import "../config.weir" as C
+import "../fmt.weir" as F
+import "../ctx.weir" as X
+
+// ---- shared -----------------------------------------------------------------
+
+let isSsh () = ["SSH_CONNECTION"; "SSH_TTY"; "SSH_CLIENT"] |> Seq.exists (fun v -> Env.get v <> None)
+
+let plainVar s = Some (F.Plain s)
+
+let alias aliases name =
+    aliases |> Seq.tryFind (fun (k, _) -> k == name) |> Option.map snd |> Option.defaultValue name
+
+let styleOnly st n = if n == "style" then Some st else None
+
+// /proc/self/status "Uid: real effective saved fs" (Linux); None elsewhere
+let uids () =
+    X.readFile "/proc/self/status"
+    |> Option.bind (fun s ->
+        Str.split "\n" s
+        |> Seq.tryPick (function | Regex @"^Uid:\s+(\d+)\s+(\d+)" (r, e) -> Some (r, e) | _ -> None))
+
+let isRoot ctx =
+    match uids () with
+    | Some (_, e) -> e == "0"
+    | None -> X.execOut ctx "id" ["-u"] == Some "0"
+
+// whoami::username: the real uid's passwd name, else $USER
+let userName ctx =
+    let fromPasswd =
+        uids ()
+        |> Option.bind (fun (r, _) ->
+            X.readFile "/etc/passwd"
+            |> Option.bind (fun s ->
+                Str.split "\n" s
+                |> Seq.tryPick (function | Regex @"^([^:]*):[^:]*:(\d+):" (n, u) when u == r -> Some n | _ -> None)))
+    match fromPasswd with
+    | Some n -> Some n
+    | None ->
+        match Env.get "USER" with
+        | Some u -> Some u
+        | None -> X.execOut ctx "id" ["-un"]
+
+type Detected =
+    | DEmpty
+    | DNegated
+    | DYes
+    | DNo
+
+// Context::detect_env_vars2
+let envDetect2 vars =
+    if Seq.isEmpty vars then DEmpty
+    elif vars |> Seq.exists (fun v -> Str.startsWith "!" v && Env.get v[1..] <> None) then DNegated
+    elif vars |> Seq.exists (fun v -> not (Str.startsWith "!" v) && Env.get v <> None) then DYes
+    else DNo
+
+// ---- username -----------------------------------------------------------------
+
+/// username: shown for root, a user other than $LOGNAME, over ssh, or always
+let username : Ctx -> seq<Seg>
+
+let username ctx =
+    let c = ctx.cfg.username
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    match userName ctx with
+    | None -> X.none
+    | Some user ->
+        let detected = envDetect2 (get (fun x -> x.detect_env_vars) [])
+        let root = isRoot ctx
+        let login = Env.get "LOGNAME" |> Option.map (fun l -> l == user) |> Option.defaultValue true
+        let visible = get (fun x -> x.show_always) false || root || not login || isSsh () || detected == DYes
+        if get (fun x -> x.disabled) false || not visible || detected == DNegated then X.none
+        else
+            let name = alias (get (fun x -> x.aliases) []) user
+            let st = if root then get (fun x -> x.style_root) "red bold" else get (fun x -> x.style_user) "yellow bold"
+            F.render (fun n -> if n == "user" then plainVar name else None) (styleOnly st) (get (fun x -> x.format) "[$user]($style) in ")
+
+// ---- hostname -----------------------------------------------------------------
+
+/// hostname: shown over ssh (ssh_only), trimmed at `trim_at`
+let hostname : Ctx -> seq<Seg>
+
+let hostname ctx =
+    let c = ctx.cfg.hostname
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    let ssh = isSsh ()
+    if get (fun x -> x.disabled) false || (get (fun x -> x.ssh_only) true && not ssh) || not (X.envDetect (get (fun x -> x.detect_env_vars) [])) then X.none
+    else
+        let raw =
+            match X.readFile "/proc/sys/kernel/hostname" |> Option.map Str.trim with
+            | Some h -> Some h
+            | None -> X.execOut ctx "hostname" []
+        match raw with
+        | None -> X.none
+        | Some h ->
+            let trimAt = get (fun x -> x.trim_at) "."
+            let host =
+                if trimAt == "" then h
+                else
+                    match Str.trySplitOnce trimAt h with
+                    | Some (before, _) -> before
+                    | None -> h
+            let shown = alias (get (fun x -> x.aliases) []) host
+            let vars n =
+                match n with
+                | "ssh_symbol" -> if ssh then Some (F.Meta (get (fun x -> x.ssh_symbol) "🌐 ")) else None
+                | "hostname" -> plainVar shown
+                | _ -> None
+            F.render vars (styleOnly (get (fun x -> x.style) "green dimmed bold")) (get (fun x -> x.format) "[$ssh_symbol$hostname]($style) in ")
+
+// /proc/net/route holds a route covering 192.0.2.0 (fields are
+// little-endian hex: 192.0.2.0 reads 000200C0); off Linux, assume yes
+let hexInt h =
+    let digits = "0123456789abcdef"
+    Str.toLower h
+    |> Str.rmatchAll @"(.)"
+    |> Seq.map (fun g -> Str.tryIndexOf g[0] digits |> Option.defaultValue 0)
+    |> Seq.fold (fun acc d -> acc * 16 + d) 0
+
+let routable () =
+    match X.readFile "/proc/net/route" with
+    | None -> true
+    | Some t ->
+        let target = hexInt "000200C0"
+        Str.split "\n" t
+        |> Seq.skip 1
+        |> Seq.exists (fun l ->
+            match Str.fields l |> Seq.freeze with
+            | _ :: dest :: _ :: _ :: _ :: _ :: _ :: mask :: _ ->
+                let m = hexInt mask
+                let d = hexInt dest
+                // a bitwise AND, digit by digit: dest == target & mask
+                let andHex a b =
+                    [0..7]
+                    |> Seq.fold (fun (acc, x, y, place) _ ->
+                        let bx = x % 16
+                        let by = y % 16
+                        let both =
+                            [0..3] |> Seq.fold (fun (r, k, p, q) _ -> (r + (if p % 2 == 1 && q % 2 == 1 then k else 0), k * 2, p / 2, q / 2)) (0, 1, bx, by)
+                        let (bits, _, _, _) = both
+                        (acc + bits * place, x / 16, y / 16, place * 16)) (0, a, b, 1)
+                let (r, _, _, _) = andHex target m
+                d == r
+            | _ -> false)
+
+// ---- localip ------------------------------------------------------------------
+
+/// localip: the source address of the default route (disabled by default)
+let localip : Ctx -> seq<Seg>
+
+let localip ctx =
+    let c = ctx.cfg.localip
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) true || (get (fun x -> x.ssh_only) true && Env.get "SSH_CONNECTION" == None) then X.none
+    else
+        // starship connects a UDP socket to 192.0.2.0 and reads its local
+        // address. Without a route there the kernel answers ENETUNREACH,
+        // which starship shows as "NetworkUnreachable"; with one, the route
+        // lookup is the same kernel decision without a socket
+        let ip =
+            if not (routable ()) then Some "NetworkUnreachable"
+            else
+                X.execOut ctx "ip" ["-4"; "route"; "get"; "192.0.2.0"]
+                |> Option.bind (fun o ->
+                    match o with
+                    | Regex @"\bsrc\s+(\S+)" a -> Some a
+                    | _ -> None)
+                |> Option.orElseWith (fun () -> X.execOut ctx "hostname" ["-I"] |> Option.bind (fun o -> Str.fields o |> Seq.tryHead))
+        match ip with
+        | None -> X.none
+        | Some a ->
+            X.render (get (fun x -> x.format) "[$localipv4]($style) ") "" (get (fun x -> x.style) "yellow bold") (fun n -> if n == "localipv4" then plainVar a else None)
+
+// ---- shlvl --------------------------------------------------------------------
+
+/// shlvl: $SHLVL at or above `threshold` (disabled by default)
+let shlvl : Ctx -> seq<Seg>
+
+let shlvl ctx =
+    let c = ctx.cfg.shlvl
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    match Env.get "SHLVL" |> Option.bind (fun s -> Str.tryToInt (Str.trim s)) with
+    | None -> X.none
+    | Some lvl ->
+        if get (fun x -> x.disabled) true || lvl < get (fun x -> x.threshold) 2 then X.none
+        else
+            let offset =
+                c
+                |> Option.bind (fun x -> x.repeat_offset)
+                |> Option.bind (fun y -> match y with | YInt n -> Some n | _ -> None)
+                |> Option.defaultValue 0
+            let base = if get (fun x -> x.repeat) false then (if lvl < 1 then 1 else lvl) else 1
+            let count = if offset > 0 then (if base - offset < 0 then 0 else base - offset) else base
+            if count == 0 then X.none
+            else
+                let sym = get (fun x -> x.symbol) "↕️  "
+                let symbol = if count == 1 then sym else Str.replicate count sym
+                X.render (get (fun x -> x.format) "[$symbol$shlvl]($style) ") symbol (get (fun x -> x.style) "bold yellow") (fun n -> if n == "shlvl" then plainVar $"{lvl}" else None)
+
+// ---- directory -----------------------------------------------------------------
+
+type Subst = {
+    src: string
+    dst: string
+    rx: bool
+}
+
+let substitutionsOf y =
+    match y with
+    | Some (YMap pairs) ->
+        pairs |> Seq.choose (fun (k, v) -> match v with | YStr s -> Some { src = k; dst = s; rx = false } | _ -> None) |> Seq.freeze
+    | Some (YSeq items) ->
+        items
+        |> Seq.choose (fun it ->
+            match it with
+            | YMap kv ->
+                let field k = kv |> Seq.tryFind (fun (n, _) -> n == k) |> Option.map snd
+                let str k = field k |> Option.bind (fun v -> match v with | YStr s -> Some s | _ -> None)
+                let rx = field "regex" |> Option.bind (fun v -> match v with | YBool b -> Some b | _ -> None) |> Option.defaultValue false
+                match (str "from", str "to") with
+                | (Some f, Some t) -> Some { src = f; dst = t; rx = rx }
+                | _ -> None
+            | _ -> None)
+        |> Seq.freeze
+    | _ -> []
+
+// Regex::replace: the FIRST match only; `$1`/`${1}` in the replacement
+let regexReplaceFirst pat repl s =
+    match Str.rmatchAll $"({pat})" s |> Seq.tryHead with
+    | None -> s
+    | Some g ->
+        let caps = g |> Seq.freeze
+        let m = caps[0]
+        let filled =
+            Str.rmatchAll @"(\$\{?\d+\}?|[^$]+|\$)" repl
+            |> Seq.map (fun t ->
+                match t[0] with
+                | Regex @"^\$\{?(\d+)\}?$" d -> caps |> Seq.tryItem (Str.toInt d) |> Option.defaultValue ""
+                | x -> x)
+            |> Str.join ""
+        match Str.tryIndexOf m s with
+        | Some i -> s[..(i - 1)] + filled + s[(i + Str.length m)..]
+        | None -> s
+
+let substitute substs dir =
+    substs |> Seq.fold (fun d sub -> if sub.rx then regexReplaceFirst sub.src sub.dst d else Str.replace sub.src sub.dst d) dir
+
+// utils/directory.rs truncate
+let truncatePath dir len =
+    if len <= 0 then None
+    else
+        let parts0 = Str.split "/" dir |> Seq.freeze
+        let parts = if (parts0 |> Seq.head) == "" then parts0 |> Seq.skip 1 |> Seq.freeze else parts0
+        let n = Seq.length parts
+        if n <= len then None else Some (parts |> Seq.skip (n - len) |> Str.join "/")
+
+let contractPath full top repl =
+    if full == top then repl
+    elif Str.startsWith (top + "/") full || top == "/" then
+        let rest = if top == "/" then full[1..] else full[(Str.length top + 1)..]
+        $"{repl}/{rest}"
+    else full
+
+// the repo's name and the path below it, from the display dir's ancestors
+let contractRepo full root =
+    if full == root then Some (Path.fileName root)
+    elif Str.startsWith (root + "/") full then Some (Path.fileName root + full[Str.length root..])
+    else None
+
+let fishStyle len full truncated =
+    let replaced = if Str.endsWith truncated full then full[..(Str.length full - Str.length truncated - 1)] else full
+    Str.split "/" replaced
+    |> Seq.map (fun w ->
+        if w == "" then ""
+        elif Str.length w <= len then w
+        elif Str.startsWith "." w then w[..len]
+        else w[..(len - 1)])
+    |> Str.join "/"
+
+let beforeRoot path repo =
+    match Str.tryRsplitOnce repo path with
+    | Some (a, _) -> a
+    | None -> path
+
+// is_write_allowed: the mode bits answer it when they agree for everyone;
+// otherwise ask the kernel (`test -w`, which also knows our groups)
+let readOnly ctx dir =
+    match File.mode dir |> try |> Option.flatten with
+    | Some m when m[1..1] == "-" && m[4..4] == "-" && m[7..7] == "-" -> not (isRoot ctx)
+    | Some m when m[1..1] == "w" && m[4..4] == "w" && m[7..7] == "w" -> false
+    | Some _ -> (X.exec ctx "test" ["-w"; dir]) == None
+    | None -> false
+
+/// directory: the cwd, home-contracted, repo-truncated, substituted, truncated
+let directory : Ctx -> seq<Seg>
+
+let directory ctx =
+    let c = ctx.cfg.directory
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) false then X.none
+    else
+        let homeSym = get (fun x -> x.home_symbol) "~"
+        let truncLen = get (fun x -> x.truncation_length) 3
+        let toRepo = get (fun x -> x.truncate_to_repo) true
+        let rootStyleOpt = c |> Option.bind (fun x -> x.repo_root_style)
+        let display =
+            if get (fun x -> x.use_logical_path) true then ctx.cwd
+            else X.execOut ctx "realpath" [ctx.cwd] |> Option.defaultValue ctx.cwd
+        let repoRoot =
+            if toRepo || rootStyleOpt <> None then
+                X.findUp display ".git" |> Option.map (fun r -> if r == "/" then r else Str.trimEnd r)
+            else None
+        let repoDir =
+            if toRepo then repoRoot |> Option.bind (fun r -> if r == ctx.home then None else contractRepo display r)
+            else None
+        let contracted = contractPath display ctx.home homeSym
+        let substs = substitutionsOf (c |> Option.bind (fun x -> x.substitutions))
+        let dir0 = repoDir |> Option.defaultValue contracted
+        let dir1 = substitute substs dir0
+        let truncated = truncatePath dir1 truncLen
+        let isTrunc = repoDir <> None || truncated <> None
+        let dirString = truncated |> Option.defaultValue dir1
+        let fishLen = get (fun x -> x.fish_style_pwd_dir_length) 0
+        let prefix =
+            if not isTrunc then ""
+            elif fishLen > 0 && Seq.isEmpty substs then fishStyle fishLen contracted dirString
+            else get (fun x -> x.truncation_symbol) ""
+        let split =
+            match (rootStyleOpt, repoRoot) with
+            | (Some _, Some root) ->
+                contractRepo display root
+                |> Option.bind (fun cp ->
+                    let first = Str.split "/" cp |> Seq.head
+                    let after =
+                        match Str.tryIndexOf first cp with
+                        | Some i -> cp[..(i - 1)] + cp[(i + Str.length first)..]
+                        | None -> cp
+                    let segsAfter = Str.split "/" after |> Seq.length
+                    if truncLen == 0 || segsAfter - 1 < truncLen then Some (beforeRoot dirString cp, first, after) else None)
+            | _ -> None
+        let (before, root, path) =
+            match split with
+            | Some (b, r, a) -> (prefix + b, r, a)
+            | None -> ("", "", prefix + dirString)
+        let fmt =
+            if before == "" && root == "" then get (fun x -> x.format) "[$path]($style)[$read_only]($read_only_style) "
+            else get (fun x -> x.repo_root_format) "[$before_root_path]($before_repo_root_style)[$repo_root]($repo_root_style)[$path]($style)[$read_only]($read_only_style) "
+        let style = get (fun x -> x.style) "cyan bold"
+        let styleVars n =
+            match n with
+            | "style" -> Some style
+            | "read_only_style" -> Some (get (fun x -> x.read_only_style) "red")
+            | "repo_root_style" -> Some (rootStyleOpt |> Option.defaultValue style)
+            | "before_repo_root_style" -> Some (get (fun x -> x.before_repo_root_style) style)
+            | _ -> None
+        let vars n =
+            match n with
+            | "path" -> plainVar path
+            | "before_root_path" -> plainVar before
+            | "repo_root" -> plainVar root
+            | "read_only" -> if readOnly ctx ctx.cwd then plainVar (get (fun x -> x.read_only) "🔒") else None
+            | _ -> None
+        F.render vars styleVars fmt
+
+// ---- memory_usage ----------------------------------------------------------------
+
+// bytesize's to_string_as(true) ("7.6 GiB"), then memory_usage's display_bs
+// (drop the space and the fraction: "7GiB")
+let displayBytes bytes =
+    if bytes < 1024 then $"{bytes}B"
+    else
+        let units = ["K"; "M"; "G"; "T"; "P"; "E"]
+        let (e, v) =
+            [1..6]
+            |> Seq.fold (fun (e, v) k -> if v >= 1024.0 && k <= 6 then (k, v / 1024.0) else (e, v)) (0, Float.ofInt bytes)
+        let shown = Float.toInt (Float.round (v * 10.0)) / 10
+        $"{shown}{units[e - 1]}iB"
+
+let meminfo () =
+    X.readFile "/proc/meminfo"
+    |> Option.map (fun s ->
+        Str.split "\n" s
+        |> Seq.choose (function | Regex @"^(\w+):\s+(\d+)" (k, v) -> Some (k, Str.toInt v * 1024) | _ -> None)
+        |> Seq.freeze)
+
+let pct total free = 100.0 * Float.ofInt (total - free) / Float.ofInt total
+
+/// memory_usage: RAM (and swap) use above `threshold` percent (disabled by default)
+let memory_usage : Ctx -> seq<Seg>
+
+let memory_usage ctx =
+    let c = ctx.cfg.memory_usage
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) true then X.none
+    else
+        match meminfo () with
+        | None -> X.none
+        | Some mi ->
+            let field k = Map.tryGet k (Map.ofPairs mi)
+            let total = field "MemTotal" |> Option.defaultValue 0
+            // systemstat's Linux free: MemFree + Buffers + Cached + SReclaimable - Shmem
+            let f k = field k |> Option.defaultValue 0
+            let free = f "MemFree" + f "Buffers" + f "Cached" + f "SReclaimable" - f "Shmem"
+            let swapTotal = field "SwapTotal" |> Option.defaultValue 0
+            let swapFree = field "SwapFree" |> Option.defaultValue 0
+            if total == 0 then X.none
+            else
+                let used = pct total free
+                if Float.toInt (Float.round used) < get (fun x -> x.threshold) 75 then X.none
+                else
+                    let usage t f = $"{displayBytes (t - f)}/{displayBytes t}"
+                    let hasSwap = swapTotal > 0
+                    let vars n =
+                        match n with
+                        | "ram" -> plainVar (usage total free)
+                        | "ram_pct" -> plainVar $"{Float.toInt (Float.round used)}%"
+                        | "swap" -> if hasSwap then plainVar (usage swapTotal swapFree) else None
+                        | "swap_pct" -> if hasSwap then plainVar $"{Float.toInt (Float.round (pct swapTotal swapFree))}%" else None
+                        | _ -> None
+                    X.render (get (fun x -> x.format) "via $symbol[$ram( | $swap)]($style) ") (get (fun x -> x.symbol) "🐏 ") (get (fun x -> x.style) "white bold dimmed") vars
+
+// ---- battery ----------------------------------------------------------------------
+
+type BatState =
+    | Full
+    | Charging
+    | Discharging
+    | Empty
+    | Unknown
+
+let mergeStates a b =
+    if a == Charging || b == Charging then Charging
+    elif a == Discharging || b == Discharging then Discharging
+    elif a == b then a
+    elif a == Unknown then b
+    elif b == Unknown then a
+    else Unknown
+
+let sysRead p = X.readFile p |> Option.map Str.trim
+
+let sysNum p = sysRead p |> Option.bind Str.tryToInt
+
+// one /sys/class/power_supply battery: (energy, energy_full, state)
+let batteryOf dir =
+    if sysRead (Path.combine dir "type") <> Some "Battery" then None
+    else
+        let full = sysNum (Path.combine dir "energy_full") |> Option.orElse (sysNum (Path.combine dir "charge_full"))
+        let now = sysNum (Path.combine dir "energy_now") |> Option.orElse (sysNum (Path.combine dir "charge_now"))
+        let cap = sysNum (Path.combine dir "capacity")
+        let state =
+            match sysRead (Path.combine dir "status") |> Option.map Str.toLower with
+            | Some "charging" -> Charging
+            | Some "discharging" -> Discharging
+            | Some "full" -> Full
+            | Some "empty" -> Empty
+            | _ -> Unknown
+        match full with
+        | Some f when f > 0 ->
+            let e =
+                match now with
+                | Some n -> Float.ofInt n
+                | None -> Float.ofInt f * Float.ofInt (cap |> Option.defaultValue 0) / 100.0
+            Some (e, Float.ofInt f, state)
+        | _ -> None
+
+/// battery: the summed charge of every battery, styled by `display` thresholds
+let battery : Ctx -> seq<Seg>
+
+let battery ctx =
+    let c = ctx.cfg.battery
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    let supplies = if Dir.exists "/sys/class/power_supply" then Dir.list "/sys/class/power_supply" else []
+    let bats = supplies |> Seq.choose batteryOf |> Seq.freeze
+    let (energy, full, state) = bats |> Seq.fold (fun (e, f, s) (e2, f2, s2) -> (e + e2, f + f2, mergeStates s s2)) (0.0, 0.0, Unknown)
+    if get (fun x -> x.disabled) false || Seq.isEmpty bats || full <= 0.0 then X.none
+    else
+        let percentage = energy / full * 100.0
+        let displays =
+            c
+            |> Option.bind (fun x -> x.display)
+            |> Option.defaultValue [{ threshold = Some 10; style = Some "red bold"; charging_symbol = None; discharging_symbol = None }]
+            |> Seq.map (fun d -> (d.threshold |> Option.defaultValue 10, d))
+            |> Seq.where (fun (t, _) -> percentage <= Float.ofInt t)
+            |> Seq.freeze
+        if Seq.isEmpty displays then X.none
+        else
+            let (_, d) = displays |> Seq.minBy fst
+            let symbol =
+                match state with
+                | Full -> get (fun x -> x.full_symbol) "󰁹 "
+                | Charging -> d.charging_symbol |> Option.defaultValue (get (fun x -> x.charging_symbol) "󰂄 ")
+                | Discharging -> d.discharging_symbol |> Option.defaultValue (get (fun x -> x.discharging_symbol) "󰂃 ")
+                | Unknown -> get (fun x -> x.unknown_symbol) "󰂑 "
+                | Empty -> get (fun x -> x.empty_symbol) "󰂎 "
+            let pctText = $"{Float.toInt (Float.round percentage)}%"
+            X.render (get (fun x -> x.format) "[$symbol$percentage]($style) ") symbol (d.style |> Option.defaultValue "red bold") (fun n -> if n == "percentage" then plainVar pctText else None)
+
+// ---- time ---------------------------------------------------------------------------
+
+let hms s =
+    match s with
+    | Regex @"^(\d{1,2}):(\d{2}):(\d{2})$" (h, m, x) -> Some (Str.toInt h * 3600 + Str.toInt m * 60 + Str.toInt x)
+    | Regex @"^(\d{1,2}):(\d{2})$" (h, m) -> Some (Str.toInt h * 3600 + Str.toInt m * 60)
+    | _ -> None
+
+let inRange now start stop =
+    match (start, stop) with
+    | (None, None) -> true
+    | (Some i, None) -> now > i
+    | (None, Some j) -> now < j
+    | (Some i, Some j) -> if i < j then i < now && now < j else now > i || now < j
+    | _ -> true
+
+// a POSIX TZ for a UTC offset in hours (POSIX writes the sign inverted)
+let tzOfOffset s =
+    match Float.tryParse s with
+    | Some h when h < 24.0 && h > -24.0 ->
+        let secs = Float.toInt (h * 3600.0)
+        let a = if secs < 0 then 0 - secs else secs
+        let sign = if secs > 0 then "-" else "+"
+        let two n = Str.padLeft 2 $"{n}" |> Str.replace " " "0"
+        Some $"UTC{sign}{two (a / 3600)}:{two (a % 3600 / 60)}:{two (a % 60)}"
+    | _ -> None
+
+/// time: the clock via `date` (strftime is date's own language); disabled by default
+let time : Ctx -> seq<Seg>
+
+let time ctx =
+    let c = ctx.cfg.time
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) true then X.none
+    else
+        let range = get (fun x -> x.time_range) "-"
+        let (start, stop) =
+            if (Str.split "-" range |> Seq.length) <> 2 then (None, None)
+            else
+                let (a, b) = Str.splitOnce "-" range
+                (hms a, hms b)
+        let now = X.execOut ctx "date" ["+%T"] |> Option.bind hms |> Option.defaultValue 0
+        if not (inRange now start stop) then X.none
+        else
+            let tf = c |> Option.bind (fun x -> x.time_format) |> Option.defaultValue (if get (fun x -> x.use_12hr) false then "%r" else "%T")
+            let offset = get (fun x -> x.utc_time_offset) "local"
+            let tz = if offset == "local" then None else tzOfOffset offset |> Option.orElse (Some offset)
+            let out =
+                match tz with
+                | None -> X.execOut ctx "date" ["+" + tf]
+                | Some z -> X.execOut ctx "env" [$"TZ={z}"; "date"; "+" + tf]
+            match out with
+            | None -> X.none
+            | Some t -> X.render (get (fun x -> x.format) "at [$time]($style) ") "" (get (fun x -> x.style) "bold yellow") (fun n -> if n == "time" then plainVar t else None)
+
+// ---- status ---------------------------------------------------------------------------
+
+let commonMeaning ex =
+    if ex > 128 then None
+    else
+        match ex with
+        | 0 -> Some ""
+        | 1 -> Some "ERROR"
+        | 2 -> Some "USAGE"
+        | 64 -> Some "USAGE"
+        | 65 -> Some "DATAERR"
+        | 66 -> Some "NOINPUT"
+        | 67 -> Some "NOUSER"
+        | 68 -> Some "NOHOST"
+        | 69 -> Some "UNAVAILABLE"
+        | 70 -> Some "SOFTWARE"
+        | 71 -> Some "OSERR"
+        | 72 -> Some "OSFILE"
+        | 73 -> Some "CANTCREAT"
+        | 74 -> Some "IOERR"
+        | 75 -> Some "TEMPFAIL"
+        | 76 -> Some "PROTOCOL"
+        | 77 -> Some "NOPERM"
+        | 78 -> Some "CONFIG"
+        | 126 -> Some "NOPERM"
+        | 127 -> Some "NOTFOUND"
+        | _ -> None
+
+let signalNames = ["HUP"; "INT"; "QUIT"; "ILL"; "TRAP"; "IOT"; "BUS"; "FPE"; "KILL"; "USR1"; "SEGV"; "USR2"; "PIPE"; "ALRM"; "TERM"; "STKFLT"; "CHLD"; "CONT"; "STOP"; "TSTP"; "TTIN"; "TTOU"]
+
+// Rust's {:X} of an i32 (two's complement for negatives)
+let hexDigits n =
+    let digits = "0123456789ABCDEF"
+    let u = if n < 0 then n + 4294967296 else n
+    if u == 0 then "0"
+    else
+        [0..7]
+        |> Seq.fold (fun (acc, v) _ -> if v == 0 then (acc, v) else (digits[(v % 16)..(v % 16)] + acc, v / 16)) ("", u)
+        |> fst
+
+/// status: the previous entry's exit code (disabled by default). weir has no
+/// pipestatus, so a pipeline reports as one status.
+let status : Ctx -> seq<Seg>
+
+let status ctx =
+    let c = ctx.cfg.status
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    // a weir error (no exit code) reads as status 1
+    let code =
+        match ctx.exit with
+        | Some n -> n
+        | None -> if ctx.ok then 0 else 1
+    let successSym = get (fun x -> x.success_symbol) ""
+    if get (fun x -> x.disabled) true || (code == 0 && successSym == "") then X.none
+    else
+        let recognize = get (fun x -> x.recognize_signal_code) true
+        let mapSym = get (fun x -> x.map_symbol) false
+        let meaning = commonMeaning code
+        let sigNum = if recognize && code >= 129 then Some (code - 128) else None
+        let sigName = sigNum |> Option.map (fun s -> signalNames |> Seq.tryItem (s - 1) |> Option.defaultValue $"{s}")
+        let maybeInt = if meaning == None && sigName == None then Some $"{code}" else None
+        let symbol =
+            if code == 0 then successSym
+            elif code == 126 && mapSym then get (fun x -> x.not_executable_symbol) "🚫"
+            elif code == 127 && mapSym then get (fun x -> x.not_found_symbol) "🔍"
+            elif code == 130 && recognize && mapSym then get (fun x -> x.sigint_symbol) "🧱"
+            elif code >= 129 && code < 256 && recognize && mapSym then get (fun x -> x.signal_symbol) "⚡"
+            else get (fun x -> x.symbol) "❌"
+        let st =
+            (if code == 0 then c |> Option.bind (fun x -> x.success_style) else c |> Option.bind (fun x -> x.failure_style))
+            |> Option.defaultValue (get (fun x -> x.style) "bold red")
+        let vars n =
+            match n with
+            | "symbol" -> Some (F.Meta symbol)
+            | "status" -> plainVar $"{code}"
+            | "int" -> plainVar $"{code}"
+            | "hex_status" -> plainVar ("0x" + hexDigits code)
+            | "maybe_int" -> maybeInt |> Option.map F.Plain
+            | "common_meaning" -> meaning |> Option.map F.Plain
+            | "signal_number" -> sigNum |> Option.map (fun s -> F.Plain $"{s}")
+            | "signal_name" -> sigName |> Option.map F.Plain
+            | _ -> None
+        F.render vars (styleOnly st) (get (fun x -> x.format) "[$symbol$status]($style) ")
+
+// ---- character -------------------------------------------------------------------------
+
+/// character: the success/error symbol (weir's editor has no vi modes, so
+/// starship's ASSUMED_MODE, insert, always holds)
+let character : Ctx -> seq<Seg>
+
+let character ctx =
+    let c = ctx.cfg.character
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) false then X.none
+    else
+        let symbol = if ctx.ok then get (fun x -> x.success_symbol) "[❯](bold green)" else get (fun x -> x.error_symbol) "[❯](bold red)"
+        F.render (fun n -> if n == "symbol" then Some (F.Meta symbol) else None) (fun _ -> None) (get (fun x -> x.format) "$symbol ")
+
+// ---- sudo ----------------------------------------------------------------------------------
+
+/// sudo: credentials are cached (`sudo -Nnv` succeeds); disabled by default
+let sudo : Ctx -> seq<Seg>
+
+let sudo ctx =
+    let c = ctx.cfg.sudo
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) true then X.none
+    else
+        let flag = if get (fun x -> x.use_legacy_check) false then "-nv" else "-Nnv"
+        if X.exec ctx "sudo" [flag] == None then X.none
+        else X.render (get (fun x -> x.format) "[as $symbol]($style)") (get (fun x -> x.symbol) "🧙 ") (get (fun x -> x.style) "bold blue") (fun _ -> None)
+
+// ---- jobs ----------------------------------------------------------------------------------
+
+/// jobs: weir has no background jobs (`within proc` scopes are not jobs), so
+/// the count is always 0 — at the defaults this renders nothing
+let jobs : Ctx -> seq<Seg>
+
+let jobs ctx =
+    let c = ctx.cfg.jobs
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    let n = 0
+    let threshold = get (fun x -> x.threshold) 1
+    let symT = get (fun x -> x.symbol_threshold) 1
+    let numT = get (fun x -> x.number_threshold) 2
+    if get (fun x -> x.disabled) false || threshold < 0 || symT < 0 || numT < 0 then X.none
+    elif n == 0 && threshold > 0 && numT > 0 && symT > 0 then X.none
+    else
+        let sym = get (fun x -> x.symbol) "✦"
+        let (s, num) =
+            if threshold == 1 then ((if n >= symT then sym else ""), (if n >= numT then $"{n}" else ""))
+            elif n > threshold || threshold == 0 then (sym, $"{n}")
+            elif n > 0 then (sym, "")
+            else ("", "")
+        X.render (get (fun x -> x.format) "[$symbol$number]($style) ") s (get (fun x -> x.style) "bold blue") (fun v -> if v == "number" then Some (F.Plain num) else None)
+
+// ---- cmd_duration -----------------------------------------------------------------------------
+
+/// cmd_duration: weir's PromptStatus carries no duration (only ok/exit), so
+/// there is nothing to show — this renders nothing
+let cmd_duration : Ctx -> seq<Seg>
+
+let cmd_duration ctx = X.none
+
+// ---- line_break / fill ---------------------------------------------------------------------------
+
+/// line_break: ends the prompt line
+let line_break : Ctx -> seq<Seg>
+
+let line_break ctx =
+    if ctx.cfg.line_break |> Option.bind (fun x -> x.disabled) |> Option.defaultValue false then X.none
+    else [F.text "\n"]
+
+/// fill: pads the line to the terminal width with `symbol`
+let fill : Ctx -> seq<Seg>
+
+let fill ctx =
+    let c = ctx.cfg.fill
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) false then X.none
+    else [{ text = get (fun x -> x.symbol) "."; style = Some (get (fun x -> x.style) "bold black"); outer = []; fill = true }]
+
+// ---- os ---------------------------------------------------------------------------------------------
+
+// os_info's Type for an os-release ID, its Display name, its default symbol
+let osTable = [
+    ("aix", "AIX", "AIX", "➿ ")
+    ("alpaquita", "Alpaquita", "Alpaquita Linux", "🔔 ")
+    ("almalinux", "AlmaLinux", "AlmaLinux", "💠 ")
+    ("alpine", "Alpine", "Alpine Linux", "🏔️ ")
+    ("altlinux", "ALTLinux", "ALT Linux", "Ⓐ ")
+    ("amzn", "Amazon", "Amazon Linux AMI", "🙂 ")
+    ("android", "Android", "Android", "🤖 ")
+    ("aosc", "AOSC", "AOSC OS", "🐱 ")
+    ("arch", "Arch", "Arch Linux", "🎗️ ")
+    ("archarm", "Arch", "Arch Linux", "🎗️ ")
+    ("artix", "Artix", "Artix Linux", "🎗️ ")
+    ("bazzite", "Bazzite", "Bazzite", "🎮 ")
+    ("bluefin", "Bluefin", "Bluefin", "🐟 ")
+    ("cachyos", "CachyOS", "CachyOS Linux", "🎗️ ")
+    ("centos", "CentOS", "CentOS", "💠 ")
+    ("debian", "Debian", "Debian", "🌀 ")
+    ("elementary", "Elementary", "elementary OS", "🍏 ")
+    ("endeavouros", "EndeavourOS", "EndeavourOS", "🚀 ")
+    ("fedora", "Fedora", "Fedora", "🎩 ")
+    ("garuda", "Garuda", "Garuda Linux", "🦅 ")
+    ("gentoo", "Gentoo", "Gentoo Linux", "🗜️ ")
+    ("instantos", "InstantOS", "instantOS", "⏲️ ")
+    ("kali", "Kali", "Kali Linux", "🐉 ")
+    ("neon", "KDENeon", "KDE neon", "⚛️ ")
+    ("mabox", "Mabox", "Mabox", "📦 ")
+    ("manjaro", "Manjaro", "Manjaro", "🥭 ")
+    ("mariner", "Mariner", "Mariner", "🌊 ")
+    ("linuxmint", "Mint", "Linux Mint", "🌿 ")
+    ("nixos", "NixOS", "NixOS", "❄️ ")
+    ("nobara", "Nobara", "Nobara Linux", "🎩 ")
+    ("opencloudos", "OpenCloudOS", "OpenCloudOS", "☁️ ")
+    ("openEuler", "openEuler", "EulerOS", "🦉 ")
+    ("opensuse", "openSUSE", "openSUSE", "🦎 ")
+    ("opensuse-leap", "openSUSE", "openSUSE", "🦎 ")
+    ("opensuse-tumbleweed", "openSUSE", "openSUSE", "🦎 ")
+    ("ol", "OracleLinux", "Oracle Linux", "🦴 ")
+    ("pikaos", "PikaOS", "PikaOS", "🐤 ")
+    ("pop", "Pop", "Pop!_OS", "🍭 ")
+    ("raspbian", "Raspbian", "Raspberry Pi OS", "🍓 ")
+    ("rhel", "RedHatEnterprise", "Red Hat Enterprise Linux", "🎩 ")
+    ("rocky", "RockyLinux", "Rocky Linux", "💠 ")
+    ("solus", "Solus", "Solus", "⛵ ")
+    ("sles", "SUSE", "SUSE Linux Enterprise Server", "🦎 ")
+    ("ubuntu", "Ubuntu", "Ubuntu", "🎯 ")
+    ("ultramarine", "Ultramarine", "Ultramarine Linux", "🔷 ")
+    ("uos", "Uos", "UOS", "🐲 ")
+    ("void", "Void", "Void Linux", " ")
+    ("zorin", "Zorin", "Zorin OS", "🔹 ")
+]
+
+let osRelease () =
+    X.readFile "/etc/os-release"
+    |> Option.orElseWith (fun () -> X.readFile "/usr/lib/os-release")
+    |> Option.map (fun s ->
+        Str.split "\n" s
+        |> Seq.choose (function | Regex @"^([A-Z_]+)=""?([^""]*)""?$" (k, v) -> Some (k, v) | _ -> None)
+        |> Seq.freeze)
+
+// (type, name, default symbol, version, codename)
+let osInfo ctx =
+    let uname = X.execOut ctx "uname" ["-s"] |> Option.defaultValue ""
+    match uname with
+    | "Darwin" ->
+        let ver = X.execOut ctx "sw_vers" ["-productVersion"]
+        ("Macos", "Mac OS", "🍎 ", ver, None)
+    | "FreeBSD" -> ("FreeBSD", "FreeBSD", "😈 ", X.execOut ctx "uname" ["-r"], None)
+    | "OpenBSD" -> ("OpenBSD", "OpenBSD", "🐡 ", X.execOut ctx "uname" ["-r"], None)
+    | "NetBSD" -> ("NetBSD", "NetBSD", "🚩 ", X.execOut ctx "uname" ["-r"], None)
+    | "DragonFly" -> ("DragonFly", "DragonFly BSD", "🐉 ", X.execOut ctx "uname" ["-r"], None)
+    | _ ->
+        let rel = osRelease () |> Option.defaultValue []
+        let field k = rel |> Seq.tryFind (fun (n, _) -> n == k) |> Option.map snd
+        let id = field "ID" |> Option.defaultValue ""
+        // os_info reads VERSION_ID as a semantic version when it is numeric
+        // ("26.04" shows as 26.4.0), else verbatim
+        let ver =
+            field "VERSION_ID"
+            |> Option.map (fun v ->
+                match v with
+                | Regex @"^(\d+)(?:\.(\d+))?(?:\.(\d+))?$" (a, b, c) ->
+                    let n x = if x == "" then "0" else $"{Str.toInt x}"
+                    $"{n a}.{n b}.{n c}"
+                | _ -> v)
+        let code = field "VERSION_CODENAME"
+        match osTable |> Seq.tryFind (fun (i, _, _, _) -> i == id) with
+        | Some (_, t, n, s) -> (t, n, s, ver, code)
+        | None -> if uname == "Linux" then ("Linux", "Linux", "🐧 ", ver, code) else ("Unknown", "Unknown", "❓ ", None, None)
+
+/// os: the operating system's symbol (disabled by default)
+let os : Ctx -> seq<Seg>
+
+let os ctx =
+    let c = ctx.cfg.os
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) true then X.none
+    else
+        let (ty, name, defSym, ver, code) = osInfo ctx
+        let symbol = get (fun x -> x.symbols) [] |> Seq.tryFind (fun (k, _) -> k == ty) |> Option.map snd |> Option.defaultValue defSym
+        let vars n =
+            match n with
+            | "symbol" -> Some (F.Meta symbol)
+            | "name" -> plainVar name
+            | "type" -> plainVar ty
+            | "version" -> ver |> Option.map F.Plain
+            | "codename" -> code |> Option.map F.Plain
+            | _ -> None
+        F.render vars (styleOnly (get (fun x -> x.style) "bold white")) (get (fun x -> x.format) "[$symbol]($style)")
+
+// ---- shell ------------------------------------------------------------------------------------------
+
+/// shell: the indicator for $STARSHIP_SHELL; under weir it is unset, so the
+/// unknown indicator (disabled by default)
+let shell : Ctx -> seq<Seg>
+
+let shell ctx =
+    let c = ctx.cfg.shell
+    let get f d = c |> Option.bind f |> Option.defaultValue d
+    if get (fun x -> x.disabled) true then X.none
+    else
+        let psh = get (fun x -> x.powershell_indicator) "psh"
+        let ind name =
+            match name with
+            | "bash" -> Some (get (fun x -> x.bash_indicator) "bsh")
+            | "fish" -> Some (get (fun x -> x.fish_indicator) "fsh")
+            | "zsh" -> Some (get (fun x -> x.zsh_indicator) "zsh")
+            | "pwsh" -> Some (c |> Option.bind (fun x -> x.pwsh_indicator) |> Option.defaultValue psh)
+            | "powershell" -> Some psh
+            | "ion" -> Some (get (fun x -> x.ion_indicator) "ion")
+            | "elvish" -> Some (get (fun x -> x.elvish_indicator) "esh")
+            | "tcsh" -> Some (get (fun x -> x.tcsh_indicator) "tsh")
+            | "nu" -> Some (get (fun x -> x.nu_indicator) "nu")
+            | "xonsh" -> Some (get (fun x -> x.xonsh_indicator) "xsh")
+            | "cmd" -> Some (get (fun x -> x.cmd_indicator) "cmd")
+            | _ -> None
+        let unknown = get (fun x -> x.unknown_indicator) ""
+        let indicator = Env.get "STARSHIP_SHELL" |> Option.bind ind |> Option.defaultValue unknown
+        let vars n =
+            match n with
+            | "indicator" -> Some (F.Meta indicator)
+            | "unknown_indicator" -> plainVar unknown
+            | Regex @"^(\w+)_indicator$" s -> ind s |> Option.map F.Plain
+            | _ -> None
+        F.render vars (styleOnly (get (fun x -> x.style) "white bold")) (get (fun x -> x.format) "[$indicator]($style) ")
+
+// ---- claude_* ---------------------------------------------------------------------------------------
+
+// claude_context / claude_cost / claude_model render the JSON Claude Code
+// pipes into `starship statusline claude-code`; a weir REPL prompt has no
+// such input (context.claude_code_data is None), and the Rust returns None
+// then — so do these.
+
+/// claude_context: Claude Code statusline data only — nothing in a REPL
+let claude_context : Ctx -> seq<Seg>
+
+let claude_context ctx = X.none
+
+/// claude_cost: Claude Code statusline data only — nothing in a REPL
+let claude_cost : Ctx -> seq<Seg>
+
+let claude_cost ctx = X.none
+
+/// claude_model: Claude Code statusline data only — nothing in a REPL
+let claude_model : Ctx -> seq<Seg>
+
+let claude_model ctx = X.none
+
+// ---- custom -----------------------------------------------------------------------------------------
+
+let yamlStrings y =
+    match y with
+    | Some (YStr s) -> [s]
+    | Some (YSeq items) -> items |> Seq.choose (fun i -> match i with | YStr s -> Some s | _ -> None) |> Seq.freeze
+    | _ -> []
+
+// shell_command: run `cmd` with the configured shell (else $STARSHIP_SHELL,
+// else sh); sh-family shells read it on stdin, cmd/nu take it as an argument
+let shellRun ctx cfg cmd =
+    let args = yamlStrings (cfg.shell)
+    let (sh, shArgs) =
+        match args with
+        | s :: rest -> (s, rest |> Seq.freeze)
+        | [] -> (Env.get "STARSHIP_SHELL" |> Option.defaultValue "sh", [])
+    let exe = Path.stem sh
+    // create_command resolves the program on PATH (bash's $0 is the full path)
+    let resolved =
+        if Str.contains "/" sh then sh
+        else
+            Env.get "PATH"
+            |> Option.defaultValue ""
+            |> Str.split ":"
+            |> Seq.map (fun d -> Path.combine d sh)
+            |> Seq.tryFind (fun p -> File.exists p && File.isExecutable p)
+            |> Option.defaultValue sh
+    let noArgs = Seq.isEmpty shArgs
+    let (extra, stdinDefault) =
+        match exe with
+        | "pwsh" | "powershell" -> ((if noArgs then ["-NoProfile"; "-Command"; "-"] else []), true)
+        | "cmd" -> ((if noArgs then ["/C"] else []), false)
+        | "nu" -> ((if noArgs then ["-c"] else []), false)
+        | _ -> ([], true)
+    let useStdin = cfg.use_stdin |> Option.defaultValue stdinDefault
+    let argv = Seq.append shArgs extra |> fun a -> (if useStdin then a else Seq.append a [cmd]) |> Seq.freeze
+    let ignoreTimeout = cfg.ignore_timeout |> Option.defaultValue false
+    let input = [cmd]
+    let run () =
+        within cd ctx.cwd
+            if useStdin then
+                let r = input | ^$resolved $@argv | complete
+                Some r
+            else $(^$resolved $@argv | complete) |> try
+    if ignoreTimeout then run ()
+    else
+        [0; 1]
+        |> Seq.pfirst (fun i ->
+            if i == 0 then run ()
+            else
+                Duration.sleep ctx.timeout
+                None)
+
+let osMatches want =
+    match want with
+    | None -> true
+    | Some o ->
+        // a dynamic head: a missing uname must not stop the prompt loading
+        let unameTool = "uname"
+        let uname = $(^$unameTool -s | complete) |> try |> Option.bind (fun r -> r.stdout |> Seq.tryHead) |> Option.defaultValue ""
+        let here =
+            match uname with
+            | "Linux" -> "linux"
+            | "Darwin" -> "macos"
+            | "FreeBSD" -> "freebsd"
+            | "OpenBSD" -> "openbsd"
+            | "NetBSD" -> "netbsd"
+            | "DragonFly" -> "dragonfly"
+            | _ -> Str.toLower uname
+        o == here || o == "unix"
+
+/// one `[custom.<name>]` module
+let customOne : Ctx -> string -> seq<Seg>
+
+let customOne ctx name =
+    let found = ctx.cfg.custom |> Option.defaultValue [] |> Seq.tryFind (fun (k, _) -> k == name) |> Option.map snd
+    match found with
+    | None -> X.none
+    | Some cfg ->
+        let get f d = Some cfg |> Option.bind f |> Option.defaultValue d
+        if get (fun x -> x.disabled) false || not (osMatches cfg.os) then X.none
+        elif get (fun x -> x.require_repo) false && X.findUp ctx.cwd ".git" == None then X.none
+        else
+            let scanned = X.scan ctx (get (fun x -> x.detect_files) []) (get (fun x -> x.detect_extensions) []) (get (fun x -> x.detect_folders) [])
+            let matched =
+                scanned ||
+                    (match cfg.whenField with
+                     | Some (YBool b) -> b
+                     | Some (YStr s) -> shellRun ctx cfg s |> Option.map (fun r -> r.exitCode == 0) |> Option.defaultValue false
+                     | _ -> false)
+            if not matched then X.none
+            else
+                let vars n =
+                    match n with
+                    | "output" ->
+                        shellRun ctx cfg (get (fun x -> x.command) "")
+                        |> Option.bind (fun r -> if r.exitCode == 0 then Some (r.stdout |> Str.join "\n" |> Str.trim) else None)
+                        |> Option.bind X.plain
+                    | _ -> None
+                X.render (get (fun x -> x.format) "[$symbol($output )]($style)") (get (fun x -> x.symbol) "") (get (fun x -> x.style) "green bold") vars
+
+// ---- env_var -------------------------------------------------------------------------------------------
+
+/// one `[env_var.<name>]` module: the variable (default: the name) or `default`
+let envVarOne : Ctx -> string -> seq<Seg>
+
+let envVarOne ctx name =
+    // an unconfigured name still renders, at the defaults (variable = name)
+    let found = ctx.cfg.env_var |> Option.defaultValue [] |> Seq.tryFind (fun (k, _) -> k == name) |> Option.map snd
+    let dflt = { default = None; description = None; disabled = None; format = None; style = None; symbol = None; variable = None }
+    match Some (found |> Option.defaultValue dflt) with
+    | None -> X.none
+    | Some cfg ->
+        let get f d = Some cfg |> Option.bind f |> Option.defaultValue d
+        if get (fun x -> x.disabled) false then X.none
+        else
+            let var = get (fun x -> x.variable) name
+            match Env.get var |> Option.orElse cfg.default with
+            | None -> X.none
+            | Some v ->
+                X.render (get (fun x -> x.format) "with [$symbol$env_value]($style) ") (get (fun x -> x.symbol) "") (get (fun x -> x.style) "black bold dimmed") (fun n -> if n == "env_value" then plainVar v else None)
+
+/// this file's modules, by starship name
+let modules : seq<string * (Ctx -> seq<Seg>)>
+
+let modules = [
+    ("battery", battery)
+    ("character", character)
+    ("claude_context", claude_context)
+    ("claude_cost", claude_cost)
+    ("claude_model", claude_model)
+    ("cmd_duration", cmd_duration)
+    ("directory", directory)
+    ("fill", fill)
+    ("hostname", hostname)
+    ("jobs", jobs)
+    ("line_break", line_break)
+    ("localip", localip)
+    ("memory_usage", memory_usage)
+    ("os", os)
+    ("shell", shell)
+    ("shlvl", shlvl)
+    ("status", status)
+    ("sudo", sudo)
+    ("time", time)
+    ("username", username)
+]

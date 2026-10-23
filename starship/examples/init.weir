@@ -1,0 +1,18 @@
+#init
+
+// the weir REPL with starship's prompt. Link this file into place (imports
+// resolve from its real location):
+//
+//     ln -s /path/to/ports/starship/examples/init.weir ~/.config/weir/init.weir
+//
+// or copy it and point the import at your checkout. The prompt reads your
+// existing ~/.config/starship.toml (or $STARSHIP_CONFIG) on every prompt.
+
+import "../starship.weir" as Ship
+
+/// starship's prompt, rendered by the weir port
+let starship st = Ship.prompt st
+
+#session {
+    prompt = starship
+}

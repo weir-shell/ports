@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "deno 1.36.4"

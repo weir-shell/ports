@@ -1,0 +1,38 @@
+#!/usr/bin/env weir
+// regenerate lib/config.weir from the vendored starship config schema, then
+// widen the fields whose schema is anyOf string|array (or object|array):
+// `weir gen types` drafts the first variant only, which would refuse a
+// valid starship.toml. They become `Yaml` and the modules read both shapes.
+
+let root = Self.scriptPath |> Path.dir |> Path.dir
+let out = Path.combine root "lib/config.weir"
+
+within cd root
+    weir gen types --schema starship --out $out
+
+let widen = [
+    ("CustomConfig", "shell")
+    ("DirectoryConfig", "substitutions")
+    ("PixiConfig", "pixi_binary")
+    ("PythonConfig", "python_binary")
+    ("SolidityConfig", "compiler")
+]
+
+let patched =
+    File.read out
+    |> Seq.scan (fun (ty, _) line ->
+        let ty2 =
+            match line with
+            | Regex @"^type (\w+) =" t -> t
+            | _ -> ty
+        let line2 =
+            match line with
+            | Regex @"^    (\w+): Option<.*>$" f when Seq.contains (ty2, f) widen -> $"    {f}: Option<Yaml>"
+            | _ -> line
+        (ty2, line2)) ("", "")
+    |> Seq.skip 1
+    |> Seq.map snd
+    |> Seq.freeze
+
+patched |> File.write out
+print $"patched {widen |> Seq.length} fields in {out}"

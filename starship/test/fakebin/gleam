@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "gleam 0.30.5"

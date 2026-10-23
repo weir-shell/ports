@@ -1,0 +1,2 @@
+#!/bin/sh
+if [ "$1" = "-Vv" ]; then printf "rustc 1.77.0 (aedd173a2 2024-03-17)\nbinary: rustc\nhost: x86_64-unknown-linux-gnu\nrelease: 1.77.0\n"; else echo "rustc 1.77.0 (aedd173a2 2024-03-17)"; fi

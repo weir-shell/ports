@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "Erlang/OTP 26 [erts-14.0] [source]\n\nElixir 1.15.4 (compiled with Erlang/OTP 26)\n"

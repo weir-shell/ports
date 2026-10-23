@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "pixi 0.20.1"

@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "julia version 1.9.3"
