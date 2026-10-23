@@ -49,7 +49,9 @@ within tmp d
 
     let cfg name lines =
         let p = fx $"{name}.toml"
-        lines |> File.write p
+        // a generous timeout: a cold toolchain (go on a CI runner) must not race
+        // the reference into dropping a version the port then shows
+        lines |> Seq.append ["command_timeout = 10000"] |> File.write p
         p
     let empty = cfg "empty" [""]
     let rich =
