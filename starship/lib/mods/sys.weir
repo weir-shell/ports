@@ -947,7 +947,9 @@ let osMatches want =
     match want with
     | None -> true
     | Some o ->
-        let uname = $(uname -s | complete) |> try |> Option.bind (fun r -> r.stdout |> Seq.tryHead) |> Option.defaultValue ""
+        // a dynamic head: a missing uname must not stop the prompt loading
+        let unameTool = "uname"
+        let uname = $(^$unameTool -s | complete) |> try |> Option.bind (fun r -> r.stdout |> Seq.tryHead) |> Option.defaultValue ""
         let here =
             match uname with
             | "Linux" -> "linux"

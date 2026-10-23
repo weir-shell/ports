@@ -66,10 +66,20 @@ print). The config types are generated, not written.
 1. **`PromptStatus` has only `ok`/`exit`.** `cmd_duration` can't be built
    (the entry's duration is unknown), and there is no pipestatus. Adding
    `duration: Duration` would close the first.
-2. **Same-named types in two imported modules collide** (`LangDefaults` in
+2. **A literal command anywhere refuses the whole program when it is not
+   on PATH.** weir resolves command names before running, which is right for
+   a script and wrong for a prompt: `printf | sha1sum` in the aws module
+   would have stopped the *entire* prompt from loading on macOS (which has
+   `shasum`). Every command in the port is a dynamic head (`^$tool`), so a
+   missing tool degrades to "module hidden"; `weir check --can starship.weir`
+   lists no literal heads, which is the audit. Related: `^$tool` resolves on
+   weir's *process* PATH, ignoring a `within env PATH=…` overlay the child
+   then receives, so the module oracle runs the port as a subprocess to give
+   both sides the same fake toolchains.
+3. **Same-named types in two imported modules collide** (`LangDefaults` in
    two mods files broke the root's check). Types are qualified at use
    (`F.Seg`), so the collision is surprising.
-3. **Checker/assembly rough edges hit repeatedly:**
+4. **Checker/assembly rough edges hit repeatedly:**
    - a multi-line list or record literal inside a lambda body that is
      followed by more lines gives "sits left of the lambda '('";
    - a trailing `&&` does not continue a line;
@@ -78,19 +88,19 @@ print). The config types are generated, not written.
    - `$(rustc -Vv | complete)` (a literal head) checks alone but fails when
      checked through an importer;
    - `Option<Yaml> == …` is refused because Yaml can hold a float.
-4. **`Path.home ()` ignores a `within env HOME=…` overlay**, while
+5. **`Path.home ()` ignores a `within env HOME=…` overlay**, while
    `Env.get "HOME"` sees it. A test harness with a fake HOME silently read
    the real one.
-5. **YAML subset:** populated flow collections (`args: ["a"]`) refuse the
+6. **YAML subset:** populated flow collections (`args: ["a"]`) refuse the
    *whole* document, even in keys the target type doesn't declare, so a
    kubeconfig with an exec plugin shows no context. `from yaml` also
    doesn't split a joined string (`Str.split "\n"` first), whereas
    json/toml do.
-6. **`weir gen types` drafts the first `anyOf` variant.** Five fields that
+7. **`weir gen types` drafts the first `anyOf` variant.** Five fields that
    are string-or-array (`python_binary`, `custom.shell`, ...) would have
    refused valid configs. `gen/types.weir` regenerates and widens them to
    `Yaml`.
-7. **Missing members** (each hand-rolled or shelled out):
+8. **Missing members** (each hand-rolled or shelled out):
    - display/grapheme width;
    - regex replace with `$1`/`$name` expansion (.NET also rejects
      `(?P<name>)`);
@@ -98,11 +108,11 @@ print). The config types are generated, not written.
    - an INI reader;
    - a PATH lookup (`which`);
    - bitwise operators (localip's route mask).
-8. **Strings have no `\u`/`\e` escape**: ESC is
+9. **Strings have no `\u`/`\e` escape**: ESC is
    `Bytes.fromHex "1b" |> Str.fromUtf8`.
-9. **Vendoring:** `weir add module` vendors one file. A multi-file module
+10. **Vendoring:** `weir add module` vendors one file. A multi-file module
    like this one is copied or symlinked as a directory.
-10. `def` is a reserved word with no meaning.
+11. `def` is a reserved word with no meaning.
 
 ## Stage 2
 

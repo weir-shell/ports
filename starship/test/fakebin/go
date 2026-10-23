@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "go version go1.20.3 linux/amd64"

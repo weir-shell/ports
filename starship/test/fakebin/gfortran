@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "GNU Fortran (GCC) 13.2.0\nCopyright\n"

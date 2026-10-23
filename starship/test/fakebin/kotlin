@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Kotlin version 1.9.10-release-459 (JRE 17.0.8+7)" >&2

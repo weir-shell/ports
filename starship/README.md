@@ -66,7 +66,9 @@ weir test/oracle_modules.weir --starship /path/to/starship   # 193 module render
 ```
 
 `oracle_modules` derives a fixture per language module from the schema's
-`detect_*` defaults, plus git scenarios (dirty, stash, detached + tags,
+`detect_*` defaults and runs it with `PATH` set to only `test/fakebin`
+(scripts printing each toolchain's real version banner), so every
+language module is compared with a version, whatever the machine has installed; plus git scenarios (dirty, stash, detached + tags,
 ahead/behind, merge conflict, rebase, inside `.git`), directory truncation /
 fish style / substitutions, status and character across exit codes, and
 env/file-driven modules (aws, kubernetes, docker_context, conda, package,

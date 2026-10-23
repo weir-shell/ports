@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "xmake v2.8.9+HEAD.13b9a2a, A cross-platform build utility based on Lua"

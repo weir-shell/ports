@@ -28,6 +28,9 @@ type Case = {
     config: string
     status: int
     env: seq<string * string>
+    /// run the port as its own process: an `env` PATH then governs which
+    /// programs both sides find (weir resolves a command on its process PATH)
+    isolated: bool
 }
 
 let cli = Args.load Cli
@@ -78,12 +81,29 @@ let oracle c =
                 let r = ^$cli.starship module $c.name --status $st | complete
                 r.stdout |> Str.join "\n"
 
-let port c =
+// the weir running this test, for the isolated cases
+let weirBin =
+    Env.need "PATH" |> Str.split ":" |> Seq.map (fun d -> Path.combine d "weir") |> Seq.find File.exists
+
+let cliBin = Path.combine root "bin/starship.weir"
+
+let portIsolated c =
     let pairs = c.env |> Seq.map (fun (k, v) -> Env.pair k v) |> Seq.freeze
+    let st = $"{c.status}"
     within cd c.dir
         within env pairs
-            let ctx = X.make (X.loadConfig c.config) c.dir (c.status == 0) (if c.status == 0 then None else Some c.status)
-            Ship.runModule ctx [c.name] c.name |> F.paint ctx.color ctx.palette 80 |> Str.join "\n"
+            let r = ^$weirBin $cliBin module --name $c.name --path $c.dir --config $c.config --status $st | complete
+            r.stdout |> Str.join "\n"
+
+let port c =
+    let pairs = c.env |> Seq.map (fun (k, v) -> Env.pair k v) |> Seq.freeze
+    if c.isolated then
+        portIsolated c
+    else
+        within cd c.dir
+            within env pairs
+                let ctx = X.make (X.loadConfig c.config) c.dir (c.status == 0) (if c.status == 0 then None else Some c.status)
+                Ship.runModule ctx [c.name] c.name |> F.paint ctx.color ctx.palette 80 |> Str.join "\n"
 
 within tmp d
     let fx p = Path.combine d p
@@ -94,7 +114,10 @@ within tmp d
         lines |> Seq.append ["command_timeout = 10000"] |> File.write p
         p
     let empty = cfg "empty" [""]
-    let base = { label = ""; name = ""; dir = d; config = empty; status = 0; env = [] }
+    let base = { label = ""; name = ""; dir = d; config = empty; status = 0; env = []; isolated = false }
+    // deterministic toolchains: every language module sees only the fake
+    // version-printing programs in test/fakebin, whatever the machine has
+    let fakebin = Path.combine root "test/fakebin"
 
     // ---- detection fixtures, one dir per module -------------------------
     let langCases =
@@ -104,7 +127,7 @@ within tmp d
             Dir.create dir
             if isDir then Dir.create (Path.combine dir marker) else ["x"] |> File.write (Path.combine dir marker)
             let styled = cfg $"styled-{name}" [$"[{name}]"; "style = 'italic fg:#123456 bg:33'"; "symbol = '[S](underline) '"]
-            let plainCase = { base with label = $"{name} ({marker})"; name = name; dir = dir }
+            let plainCase = { base with label = $"{name} ({marker})"; name = name; dir = dir; env = [("PATH", fakebin)]; isolated = true }
             [plainCase; { plainCase with label = $"{name} styled"; config = styled }])
         |> Seq.freeze
 

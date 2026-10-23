@@ -80,7 +80,14 @@ let iniGet props key = props |> Seq.tryFind (fun (k, _) -> k == key) |> Option.m
 
 let has props key = iniGet props key <> None
 
-let sha1Hex s = $(printf "%s" $s | sha1sum | line) |> try |> Option.map (fun l -> Str.fields l |> Seq.head)
+// weir has no SHA-1: shell out. Dynamic heads, so a machine without the tool
+// (macOS has shasum, not sha1sum) gets None at run time instead of refusing
+// to load the prompt: weir resolves literal command names before running.
+let printfTool = "printf"
+
+let sha1With tool s = $(^$printfTool "%s" $s | ^$tool | line) |> try |> Option.map (fun l -> Str.fields l |> Seq.head)
+
+let sha1Hex s = sha1With "sha1sum" s |> Option.orElseWith (fun () -> sha1With "shasum" s)
 
 let bom = Bytes.fromHex "efbbbf" |> Str.fromUtf8
 

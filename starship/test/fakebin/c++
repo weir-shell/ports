@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "g++ (GCC) 13.2.0\nCopyright (C) 2023 Free Software Foundation, Inc.\n"

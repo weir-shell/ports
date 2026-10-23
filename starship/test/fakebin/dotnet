@@ -1,0 +1,2 @@
+#!/bin/sh
+case "$1" in --version) echo 7.0.100;; --list-sdks) printf "6.0.400 [/usr/share/dotnet/sdk]\n7.0.401 [/usr/share/dotnet/sdk]\n";; esac

@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "OpenJDK 64-Bit Server VM (17.0.8+7) for linux-amd64 JRE (17.0.8+7), built on Jul 18 2023 by builder" >&2
