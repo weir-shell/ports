@@ -197,7 +197,7 @@ let shlvl ctx =
                 |> Option.bind (fun x -> x.repeat_offset)
                 |> Option.bind (fun y -> match y with | YInt n -> Some n | _ -> None)
                 |> Option.defaultValue 0
-            let base = if get (fun x -> x.repeat) false then (if lvl < 1 then 1 else lvl) else 1
+            let base = if get (fun x -> x.repeat_field) false then (if lvl < 1 then 1 else lvl) else 1
             let count = if offset > 0 then (if base - offset < 0 then 0 else base - offset) else base
             if count == 0 then X.none
             else
