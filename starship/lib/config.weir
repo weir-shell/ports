@@ -1064,7 +1064,7 @@ type ShLvlConfig = {
     disabled: Option<bool>
     format: Option<string>
     [<Wire "repeat">]
-    repeat: Option<bool>
+    repeat_field: Option<bool>
     repeat_offset: Option<Yaml>
     style: Option<string>
     symbol: Option<string>
