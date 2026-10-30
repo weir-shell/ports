@@ -112,7 +112,9 @@ print). The config types are generated, not written.
    `Bytes.fromHex "1b" |> Str.fromUtf8`.
 10. **Vendoring:** `weir add module` vendors one file. A multi-file module
    like this one is copied or symlinked as a directory.
-11. `def` is a reserved word with no meaning.
+11. `def` is a reserved word with no meaning. (v0.0.78 freed `def` but made
+   `repeat` a keyword: `shlvl.repeat` is now `repeat_field` with
+   `[<Wire "repeat">]`, so the TOML key is unchanged.)
 
 ## Stage 2
 
